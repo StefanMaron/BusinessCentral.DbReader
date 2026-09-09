@@ -18,7 +18,7 @@ public class RestoreCliTests
         var o = Program.ParseOpts(new[]
         {
             "--to", "Server=localhost;Database=CRONUS;", "--replace", "--dry-run",
-            "--include-system", "--no-create", "--strict", "--batch-size", "5000", "--table", "a,b",
+            "--include-system", "--no-create", "--strict", "--batch-size", "5000", "--table", "a,b", "--exclude-table", "c,d",
         }, "restore");
         Assert.Equal("Server=localhost;Database=CRONUS;", o["to"]);
         Assert.Equal("true", o["replace"]);
@@ -28,6 +28,7 @@ public class RestoreCliTests
         Assert.Equal("true", o["strict"]);
         Assert.Equal("5000", o["batch-size"]);
         Assert.Equal("a,b", o["table"]);
+        Assert.Equal("c,d", o["exclude-table"]);
     }
 
     [Fact]
@@ -64,6 +65,7 @@ public class RestoreCliTests
         {
             "--to", "Server=tcp:localhost,1433;Database=CRONUS;", "--replace", "--dry-run",
             "--include-system", "--no-create", "--strict", "--batch-size", "250", "--table", " probe_dense , probe_notnull ",
+            "--exclude-table", " probe_row , probe_page ",
         }, "restore"), out var connection);
 
         Assert.Equal("Server=tcp:localhost,1433;Database=CRONUS;", connection);
@@ -74,6 +76,7 @@ public class RestoreCliTests
         Assert.True(opts.Strict);
         Assert.Equal(250, opts.BatchSize);
         Assert.Equal(new[] { "probe_dense", "probe_notnull" }, opts.OnlyTables);
+        Assert.Equal(new[] { "probe_row", "probe_page" }, opts.ExcludeTables);
     }
 
     [Fact]
@@ -87,6 +90,7 @@ public class RestoreCliTests
         Assert.True(opts.CreateMissing);     // a table the container lacks is created, not refused
         Assert.False(opts.Strict);           // one unreconcilable table does not stop the other 4,000
         Assert.Empty(opts.OnlyTables);
+        Assert.Empty(opts.ExcludeTables);
         Assert.True(opts.BatchSize > 0);
     }
 

@@ -61,6 +61,24 @@ public sealed record RestoreOptions
     public IReadOnlyCollection<string> OnlyTables { get; init; } = Array.Empty<string>();
 
     /// <summary>
+    /// These source tables (raw SQL object names) are left alone entirely — not created,
+    /// not written, target rows untouched. Checked before every other rule, including
+    /// --table: it always wins, the same way $ndo$ tables always win over --table.
+    ///
+    /// For restoring into a database that is already running, not a blank one: the
+    /// container's own login/session/company-identity tables — `User`, `Access Control`,
+    /// `User Personalization`, the platform's `$ndo$tenantcompany` registry — are not part
+    /// of the exported tenant's business data, they are how *this* server knows who can
+    /// sign in and what it currently considers the tenant's companies. Restoring them
+    /// replaces the container's own working identity with the source's, which is business
+    /// data for the source's server, not something a target server should adopt.
+    /// $ndo$-prefixed tables already default to excluded (<see cref="IncludeSystem"/>);
+    /// this is the same idea for ordinary-looking tables that also happen to be
+    /// container-local rather than business data.
+    /// </summary>
+    public IReadOnlyCollection<string> ExcludeTables { get; init; } = Array.Empty<string>();
+
+    /// <summary>
     /// Include the platform's own bookkeeping tables — the ones whose SQL name starts with
     /// '$', such as $ndo$dbproperty and $ndo$navappinstalledapp. They are excluded by
     /// default because they describe the *service tier's* view of the database it is
@@ -126,6 +144,9 @@ public static class RestorePlanner
     /// <summary>The reason a table filtered out by --table carries, so the report can count them rather than list them.</summary>
     public const string FilteredOut = "not named by --table";
 
+    /// <summary>The reason a table named by --exclude-table carries.</summary>
+    public const string ExcludedOut = "excluded by --exclude-table: left untouched";
+
     /// <summary>Source tables whose SQL name starts with '$' are the platform's own — see <see cref="RestoreOptions.IncludeSystem"/>.</summary>
     public static bool IsSystemTable(string sqlName) => sqlName.StartsWith('$');
 
@@ -139,11 +160,17 @@ public static class RestorePlanner
             list.Add(t);
         }
         var only = new HashSet<string>(opts.OnlyTables, StringComparer.OrdinalIgnoreCase);
+        var exclude = new HashSet<string>(opts.ExcludeTables, StringComparer.OrdinalIgnoreCase);
         var plans = new List<TablePlan>();
         var skipped = new List<SkippedTable>();
 
         foreach (var st in source.Tables.OrderBy(t => t.Name, StringComparer.Ordinal))
         {
+            if (exclude.Contains(st.Name))
+            {
+                skipped.Add(new SkippedTable(st.Name, ExcludedOut));
+                continue;
+            }
             if (only.Count > 0 && !only.Contains(st.Name))
             {
                 skipped.Add(new SkippedTable(st.Name, FilteredOut));

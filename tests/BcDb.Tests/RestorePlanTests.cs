@@ -135,6 +135,43 @@ public class RestorePlanTests : IDisposable
     }
 
     [Fact]
+    public void ExcludeTablesLeavesThemUntouchedAndSkipsThemByName()
+    {
+        // The container's own login/session/company-identity tables (User, Access
+        // Control, User Personalization, $ndo$tenantcompany, ...) are not business data:
+        // a restore into a database that is already running should be able to leave them
+        // alone entirely, the way it can already leave $ndo$ tables alone by default.
+        var plan = Build(MirrorAll(), new RestoreOptions { ExcludeTables = new[] { "probe_notnull" } });
+        Assert.DoesNotContain(plan.Tables, p => p.Source.Name == "probe_notnull");
+        Assert.Contains(plan.Tables, p => p.Source.Name == "probe_dense");
+        Assert.Contains(plan.Skipped, s => s.Name == "probe_notnull" && s.Reason.Contains("--exclude-table"));
+    }
+
+    [Fact]
+    public void ExcludeTablesIsCaseInsensitiveAndWinsOverCreate()
+    {
+        // Excluded means excluded even though --no-create was never asked for: the table
+        // is left alone, not created-and-then-somehow-skipped.
+        var target = MirrorAll().Where(t => t.Name != "probe_notnull").ToList();
+        var plan = Build(target, new RestoreOptions { ExcludeTables = new[] { "PROBE_NOTNULL" } });
+        Assert.DoesNotContain(plan.Tables, p => p.Source.Name == "probe_notnull");
+        Assert.Contains(plan.Skipped, s => s.Name == "probe_notnull");
+    }
+
+    [Fact]
+    public void OnlyTablesAndExcludeTablesCombine()
+    {
+        // --table narrows to a set; --exclude-table can still carve a table back out of
+        // that set, e.g. "restore just these two tables, but not this one's data."
+        var plan = Build(MirrorAll(), new RestoreOptions
+        {
+            OnlyTables = new[] { "probe_notnull", "probe_dense" },
+            ExcludeTables = new[] { "probe_notnull" },
+        });
+        Assert.Equal(new[] { "probe_dense" }, plan.Tables.Select(p => p.Source.Name));
+    }
+
+    [Fact]
     public void ASourceColumnTheTargetTableLacksIsAddedToIt()
     {
         var target = MirrorAll().Replace(RestoreTestSchema.Mirror(_src, "probe_notnull").With("n_nvarchar", null));

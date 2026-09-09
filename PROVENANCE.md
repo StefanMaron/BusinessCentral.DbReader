@@ -864,6 +864,49 @@ table it creates is one BC will accept.
 - The rows landed exactly: all 5 rows and 106 columns of the demo Customer table were
   written from a `BACKUP DATABASE` of the container's own CRONUS and read back identical,
   with a deliberately tampered value overwritten by the original.
+- **A whole-database `--replace` restore also overwrites the container's own login and
+  session identity — because those are ordinary tables too**, and the web client cannot
+  come up without them. Reproduced end to end on a real 52 MB production `.bacpac`
+  restored over a `MsDyn365Bc.On.Linux` container (BC 28.4): after `--replace`, sign-in
+  failed in three successive, distinct ways, each traced to a specific table the restore
+  had correctly overwritten with the source's own rows:
+  - `User` and `Access Control` — the container's local `BCRUNNER` login and its `SUPER`
+    grant are replaced by the source tenant's own users, who have no meaning in the
+    target's Windows/NavUserPassword auth. Login itself still succeeds (the identity used
+    to authenticate is separate from the AL-level `User` table), but the web client's own
+    "open a company" step throws *"There is no User within the filter"* — then, once a row
+    exists, *"the current permissions prevented the action (TableData 2000000120 User
+    IndirectRead)"* — because the platform checks the AL `User`/`Access Control` tables as
+    part of its own login sequence, not just the auth layer.
+  - `User Personalization` — the row that remembers a user's chosen company and profile
+    is source data too; a blank or stale one throws `InvalidHomepageException` ("The
+    metadata object Page 0 was not found") from `GetNavigationFrame`, which the web client
+    shows only as an unending "Getting ready…" spinner (no rendered error at all — the
+    failure is server-side, over the `csh` WebSocket, invisible without inspecting the NST
+    log or the WebSocket frames directly; a plain HTTP request against `/SignIn` proves
+    nothing, since that page renders before any of this runs).
+  - `$ndo$tenantcompany` — the platform's own index of which companies exist, distinct
+    from the AL `Company` table and already excluded by default (it is `$`-prefixed). It is
+    *not* independent identity, though: it needs to track `Company`'s actual content, and
+    left alone across a restore that changed which companies exist, it defaults the web
+    client at a company name (observed: the pre-restore demo company) that no longer has a
+    row in `Company` — *"The Company does not exist."*
+  - On a **fresh, never-restored** container, all of `User`, `Access Control`,
+    `User Personalization`, `Profile` and `Tenant Profile` start empty and get seeded
+    lazily on first real sign-in (confirmed by driving an actual login with Playwright and
+    watching the row counts change) — takes on the order of 30-45 s, well past a first
+    naive ~20 s check. That self-heal does not run again once rows already exist for a
+    SID, even blank ones, which is why a restored container's *stale* rows fail loudly
+    instead of being quietly reseeded.
+  - **`--exclude-table`** (added for exactly this) leaves named tables completely
+    untouched — not created, not written, target rows left as they were — so the
+    container's own `User`/`Access Control`/`User Personalization` survive a
+    `--replace` restore intact. `$ndo$tenantcompany` does *not* belong in that list (it
+    needs reconciling to the restored `Company` rows, not preserving); with the other
+    three excluded and `$ndo$tenantcompany`'s two stale names hand-updated to the two
+    restored company names, the same production `.bacpac` came up in the real web client
+    end to end — full role center, real nav (including a third-party Shopify extension
+    entry), real restored customer data — with zero further manual intervention.
 
 ## Writing rows back: `bcdb restore` (`RestorePlan.cs`, `RestoreValues.cs`, `SqlRestore.cs`)
 

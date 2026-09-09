@@ -103,7 +103,7 @@ public static class Program
                                                               "merge-extensions": ..}; one JSON response line each. A key the command
                                                               does not accept fails the request instead of being ignored.)
               bcdb verify <file> --fixture <fixture.tsv> --table <name> --select "A,B"
-              bcdb restore <file> --to "<connection string>" [--replace] [--dry-run] [--table "A,B"] [--include-system] [--no-create] [--strict] [--batch-size N]
+              bcdb restore <file> --to "<connection string>" [--replace] [--dry-run] [--table "A,B"] [--exclude-table "A,B"] [--include-system] [--no-create] [--strict] [--batch-size N]
                                                              write the source's rows into a database that already
                                                              exists — a BC container with its extensions installed.
                                                              Tables and columns are matched by name; a table or
@@ -117,9 +117,15 @@ public static class Program
                                                              the platform's own $ndo$... tables, which normally
                                                              belong to the container; --strict stops the whole
                                                              restore on a table that cannot be reconciled instead of
-                                                             reporting it and carrying on. A container's certificate
-                                                             is self-signed, so the connection string needs
-                                                             TrustServerCertificate=True.
+                                                             reporting it and carrying on. --exclude-table leaves
+                                                             specific tables completely untouched (not created, not
+                                                             written) — for the container's own login/session/
+                                                             company-identity tables (User, Access Control, User
+                                                             Personalization, $ndo$tenantcompany, ...) when restoring
+                                                             into a database that is already running and signed
+                                                             into, rather than a blank one; it wins over --table.
+                                                             A container's certificate is self-signed, so the
+                                                             connection string needs TrustServerCertificate=True.
               bcdb --version                                      version, platform and build flavor
             check and validate are page-map commands and need a .bak.
             --prefetch works with any command. An option the command does not accept fails
@@ -156,7 +162,7 @@ public static class Program
         ["read"] = ReadOpts,
         ["verify"] = ReadOpts.Concat(new[] { "fixture" }).ToArray(),
         ["serve"] = new[] { "symbols" },
-        ["restore"] = new[] { "to", "replace", "dry-run", "batch-size", "table", "include-system", "no-create", "strict" },
+        ["restore"] = new[] { "to", "replace", "dry-run", "batch-size", "table", "exclude-table", "include-system", "no-create", "strict" },
     };
 
     /// <summary>Accepted by every subcommand: it is applied when the file is opened.</summary>

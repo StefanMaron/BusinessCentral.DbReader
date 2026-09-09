@@ -47,6 +47,10 @@ public static class SqlRestore
         foreach (var s in skipped)
         {
             if (s.Reason == RestorePlanner.FilteredOut) { filtered++; continue; }
+            // --exclude-table is a caller naming specific tables on purpose (typically a
+            // short, deliberate list, e.g. the container's own login/session tables) — say
+            // which ones, unlike the --table filter count above, which is usually thousands
+            // of tables the caller did not ask about individually.
             log.WriteLine($"skip  {s.Name}: {s.Reason}");
         }
         if (filtered > 0) log.WriteLine($"skip  {filtered} tables not named by --table");
@@ -272,10 +276,14 @@ public static class RestoreCommand
         var only = opts.TryGetValue("table", out var t)
             ? t.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray()
             : Array.Empty<string>();
+        var exclude = opts.TryGetValue("exclude-table", out var ex)
+            ? ex.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray()
+            : Array.Empty<string>();
 
         return new RestoreOptions
         {
             OnlyTables = only,
+            ExcludeTables = exclude,
             IncludeSystem = opts.ContainsKey("include-system"),
             Replace = opts.ContainsKey("replace"),
             CreateMissing = !opts.ContainsKey("no-create"),

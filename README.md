@@ -227,6 +227,14 @@ What it does, and refuses to do:
   They describe the service tier's own view of the database — which apps are
   installed, which tenant this is — and those answers belong to the container, not
   to the export. Overwriting them breaks the container instead of filling it.
+- **`--exclude-table "A,B"` leaves specific tables completely untouched** — not
+  created, not written, target rows left exactly as they were. For restoring into a
+  container that is already running and signed into, not a blank one: the
+  container's own login/session tables (`User`, `Access Control`,
+  `User Personalization`) are ordinary tables as far as the restore is concerned, so
+  a plain `--replace` restore correctly overwrites them with the source tenant's own
+  users — which then locks the container's own admin login out of the web client.
+  Excluding those three keeps the local login working; it wins over `--table`.
 - Rowversion columns are never written (SQL Server stamps its own), identity values
   *are* preserved, and constraints are not checked during the load, so table order
   does not matter.
