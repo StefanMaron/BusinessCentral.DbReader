@@ -797,6 +797,74 @@ Value encodings, relative to the storage forms the `.bak` reader already decodes
   so a column whose SQL name has a trailing space — BC has them — cannot be addressed by
   `--select` in either container, though a `read` without `--select` still returns it.
 
+## Column nullability (`Catalog.cs`)
+
+Nothing in the reading path needs it: a record's null bitmap carries a bit for a column
+whether or not the column accepts NULL, which is why this went underived for so long.
+Recreating a table somewhere else does need it, and that is what `bcdb restore` does when
+the target lacks a table.
+
+- **`syscolpars.status` bit `0x01` = NOT NULL.** The fixed part of a syscolpars record is
+  41 bytes: `id u32@0, number i16@4, colid u32@6, xtype u8@10, utype u32@11, length i16@15,
+  prec u8@17, scale u8@18, collationid u32@19, status u32@23, maxinrow i16@27`.
+  Derived from the probe database, which is already a known-value probe for exactly this:
+  `probe` declares every type NULL, `probe_notnull` and `probe_dense` declare every type
+  NOT NULL. Every NOT NULL column carries `0x01`; no nullable column does.
+- **Bit `0x02` rides along on char/varchar/nchar/binary/varbinary columns** and on nothing
+  else — ANSI_PADDING, recorded per column. It is not read; naming it here is what stops
+  the next reader from mistaking a `status` of 2 for a nullability flag.
+- **Validated against the oracle for all 383 columns** of every user table of the probe
+  database (`fixtures/typeprobe-nullability.tsv`, `sys.columns.is_nullable` from a restore
+  of the same `typeprobe.bak`): 64 NOT NULL, 319 nullable, no disagreement. The `.bacpac`
+  side needs no derivation — model.xml states it — and is held to the same fixture.
+
+## What BC's own tables look like (read off a live container)
+
+Measured on a Business Central 28.4 container (`MsDyn365Bc.On.Linux`, CRONUS demo
+database, 4,273 tables), because `bcdb restore` creating a table is only useful if the
+table it creates is one BC will accept.
+
+- **Every column is NOT NULL.** `CRONUS International Ltd_$Customer$437dbf0e-…` has 107
+  columns, 0 nullable, 105 with a default (`(N'')` for text). A restore supplies every
+  column of every row it writes, so it creates the columns and leaves the defaults to the
+  service tier's own schema synchronisation.
+- **The clustered index is a primary key named `<table>$Key1`** — `PRIMARY KEY CLUSTERED`,
+  unique, over the AL primary key (`No_` for Customer). That is the shape
+  `RestoreDdl.CreateTable` emits.
+- **Text columns are `Latin1_General_100_CS_AS`, and so is the database's own default
+  collation.** 30,249 of the database's collated columns carry it. A column created
+  without an explicit collation therefore inherits exactly the right one — naming it would
+  only be a way to get it wrong on a database collated differently, so the DDL does not.
+- **The `timestamp` rowversion column is the table's first column.** It is created and
+  never written.
+- **A company is a row in the `Company` table plus its own copy of every company table.**
+  The 28.4 demo database carries 1,987 tables under `CRONUS International Ltd_$…` and the
+  same 1,987 under `My Company$…`, while `Company` itself has no company prefix and holds
+  one row per company. So a cloud tenant whose company is named differently from the
+  container's shares no table name with it at all: with creation on, its tables are created
+  under its own name and the `Company` row that registers it travels in the same restore.
+- **A table `bcdb` created is a table BC uses.** The demo `Customer` table was dropped
+  outright (the state an uninstalled extension leaves), recreated by `bcdb restore` from a
+  backup of the same database, and compared against what BC itself had built: all 107
+  columns identical in id, name, type, width, precision, scale and nullability; the same
+  clustered primary key `…$Key1` over `No_`; the same `Latin1_General_100_CS_AS`. BC's API
+  then served all five customers from it **without restarting the service tier** — a
+  dropped-and-recreated data table needs no metadata change, unlike a rewritten one, whose
+  cached rows are what the JIT-load check trips over.
+
+## Restoring into a container that is running
+
+- **The service tier caches records, and a restore under a live NST is visible to it.**
+  Observed: a row edited directly in SQL was served by the API immediately (so the NST does
+  read through), but after `bcdb restore --replace` rewrote the table, every subsequent API
+  request failed with *"The field 'Name' on table 'Customer' has changed in the database
+  between initial and JIT load"* — BC's partial-record consistency check comparing its
+  cached initial load against a just-in-time reload. It did not clear on retry. **Restart
+  the service tier after a restore**; the data itself was correct in SQL throughout.
+- The rows landed exactly: all 5 rows and 106 columns of the demo Customer table were
+  written from a `BACKUP DATABASE` of the container's own CRONUS and read back identical,
+  with a deliberately tampered value overwritten by the original.
+
 ## Writing rows back: `bcdb restore` (`RestorePlan.cs`, `RestoreValues.cs`, `SqlRestore.cs`)
 
 The one command that writes. It carries a source's rows into a database that already
@@ -847,18 +915,21 @@ takes. What follows is therefore mostly *decisions and their evidence*, not stru
   fixture's own `SELECT`, compared against the same fixture. It needs a server, so it is
   a `SkippableFact` gated on `BCDB_RESTORE_SQL`, and `verify.sh` both passes the oracle in
   and fails if the tests report as skipped there.
-- **Mismatches refuse rather than approximate.** A source column with no target column, a
-  narrower or differently-typed target column, a different decimal scale or lower
-  precision, a `NOT NULL` target column with no default and no source column: each throws
-  naming the table and column. Widening is accepted (a target `nvarchar(200)` holds
-  everything an `nvarchar(100)` did), `decimal` and `numeric` are the same type, and a
-  computed target column is skipped because it derives its own value. A source *table* the
-  target does not have is the one expected mismatch — an extension that is not installed —
-  and it is reported and skipped, because nothing that was going to be written is lost.
-  The whole plan is built before any write, so a refusal leaves the target untouched;
-  `--skip-mismatched` turns a column mismatch into a whole-table skip carrying the
-  mismatch as its reason, for exports whose apps have moved on, and never loads such a
-  table part way.
+- **What the target lacks is created, not refused.** A table the target does not have is
+  created from the source's own schema; a column missing from a table that does exist is
+  added. That is the useful default because BC tolerates a database holding more than its
+  extensions declare — a table or column nothing owns is ignored — and because a table that
+  already exists when its extension is installed is adopted rather than rejected, which is
+  the same path an uninstall/reinstall takes to keep a table's data across the gap.
+  `--no-create` turns it off for a target whose schema must not be touched.
+- **What is still refused is a value arriving as a different value.** A target column
+  narrower than the source's, a different type, a different decimal scale or lower
+  precision, a `NOT NULL` target column with no default and no source column: each names
+  the table and column. Widening is accepted (a target `nvarchar(200)` holds everything an
+  `nvarchar(100)` did), `decimal` and `numeric` are the same type, and a computed target
+  column is skipped because it derives its own value. Such a table is reported and skipped
+  by default — the plan is built before any write, so nothing from it lands either way, and
+  the other 4,000 tables still load; `--strict` makes it stop the whole run instead.
 - **A non-empty target table is refused without `--replace`.** Adding a tenant's rows to a
   container's demo data gives a database that is neither. With `--replace` each table is
   emptied first: `TRUNCATE`, falling back to `DELETE` (reported, not silent) where a

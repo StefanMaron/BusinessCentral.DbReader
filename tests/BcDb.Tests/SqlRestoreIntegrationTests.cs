@@ -186,7 +186,7 @@ public class SqlRestoreIntegrationTests
     }
 
     [SkippableFact]
-    public void ATableTheTargetDoesNotHaveIsReportedAndTheRestStillLoads()
+    public void TablesTheTargetDoesNotHaveAreCreatedAndLoaded()
     {
         Skip.If(string.IsNullOrEmpty(Server), $"{EnvVar} is not set — this test needs a real SQL Server");
 
@@ -195,6 +195,73 @@ public class SqlRestoreIntegrationTests
         {
             using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
             var report = SqlRestore.Run(src, scratch, new RestoreOptions(), TextWriter.Null);
+
+            // probe_notnull was there; everything else the source has was created.
+            Assert.Contains(report.Loaded, l => l.Table == "probe_notnull");
+            Assert.Contains(report.Loaded, l => l.Table == "probe_dense");
+            Assert.Contains(report.Planned, p => p.Source.Name == "probe_dense" && p.CreateTable);
+            Assert.Contains(report.Planned, p => p.Source.Name == "probe_notnull" && !p.CreateTable);
+            // The platform table is still left alone — creating is permissive, not blind.
+            Assert.Contains(report.Skipped, s => s.Name == "$probe$platform");
+            Assert.DoesNotContain(report.Loaded, l => l.Table == "$probe$platform");
+
+            // The table that was already there still reads back as the oracle's values.
+            Assert.Equal(ExpectedRows(), Query(scratch, ReadBackSql));
+
+            // A created table holds every row, and carries the source's key as a clustered
+            // primary key — the shape BC's own schema synchronisation produces.
+            Assert.Equal(4000, Query(scratch, "SELECT CAST(COUNT(*) AS varchar(10)) FROM probe_dense")
+                .Select(int.Parse).Single());
+            Assert.Equal(new[] { "probe_dense$Key1|CLUSTERED|1|id" }, Query(scratch, """
+                SELECT CONCAT(i.name COLLATE DATABASE_DEFAULT,'|',i.type_desc COLLATE DATABASE_DEFAULT,
+                              '|',i.is_primary_key,'|',c.name COLLATE DATABASE_DEFAULT)
+                FROM sys.indexes i
+                JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id
+                JOIN sys.columns c ON c.object_id=i.object_id AND c.column_id=ic.column_id
+                WHERE i.object_id=OBJECT_ID('probe_dense') AND i.index_id=1 ORDER BY ic.key_ordinal
+                """));
+
+            // Created columns carry the source's own nullability, not a guess.
+            Assert.Equal(new[] { "c_nvarchar|1", "id|0" }, Query(scratch, """
+                SELECT CONCAT(name COLLATE DATABASE_DEFAULT,'|',is_nullable) FROM sys.columns
+                WHERE object_id=OBJECT_ID('probe') AND name IN ('id','c_nvarchar') ORDER BY name
+                """));
+        }
+        finally { DropScratchDatabase(); }
+    }
+
+    [SkippableFact]
+    public void AColumnTheTargetTableLacksIsAddedToIt()
+    {
+        Skip.If(string.IsNullOrEmpty(Server), $"{EnvVar} is not set — this test needs a real SQL Server");
+
+        var scratch = FreshScratchDatabase();
+        try
+        {
+            Exec(scratch, "ALTER TABLE probe_notnull DROP COLUMN n_nvarchar");
+            using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
+            var report = SqlRestore.Run(src, scratch,
+                new RestoreOptions { OnlyTables = new[] { "probe_notnull" } }, TextWriter.Null);
+
+            var plan = Assert.Single(report.Planned);
+            Assert.Equal(new[] { "n_nvarchar" }, plan.AddColumns.Select(c => c.Name));
+            // The column came back and its values came with it.
+            Assert.Equal(ExpectedRows(), Query(scratch, ReadBackSql));
+        }
+        finally { DropScratchDatabase(); }
+    }
+
+    [SkippableFact]
+    public void WithNoCreateAMissingTableIsReportedAndTheRestStillLoads()
+    {
+        Skip.If(string.IsNullOrEmpty(Server), $"{EnvVar} is not set — this test needs a real SQL Server");
+
+        var scratch = FreshScratchDatabase();     // holds probe_notnull and nothing else
+        try
+        {
+            using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
+            var report = SqlRestore.Run(src, scratch,
+                new RestoreOptions { CreateMissing = false }, TextWriter.Null);
 
             Assert.Equal(new[] { "probe_notnull" }, report.Loaded.Select(l => l.Table));
             Assert.Contains(report.Skipped, s => s.Name == "probe_dense");

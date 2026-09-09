@@ -206,17 +206,18 @@ AppSource apps: whatever the container's apps declare is what the data lands in.
 
 What it does, and refuses to do:
 
-- **A table the target does not have is reported and skipped.** That is the normal
-  case — an extension that is not installed — and it costs nothing that was going
-  to be written.
-- **A column mismatch inside a matched table stops the load**, naming the table and
-  column: a source column with no target column, a narrower or differently-typed
-  target column, a `NOT NULL` target column with no default and no source. Loading
-  those rows anyway would produce a database that looks loaded and is wrong. The plan
-  is built before anything is written, so a refusal leaves the target untouched —
-  normally it means the container has the wrong version of an extension installed.
-  `--skip-mismatched` reports such a table and carries on with the rest; it never
-  loads one part way.
+- **A table or column the target does not have is created**, from the source's own
+  schema — types, widths, scales and nullability, plus the source's key as a
+  clustered primary key named `<table>$Key1`, which is the shape BC's own schema
+  synchronisation produces. This is the useful default: BC ignores a table or column
+  none of its extensions declares, and *adopts* a table that already exists when its
+  extension is installed — the same path an uninstall/reinstall takes to keep a
+  table's data across the gap. `--no-create` turns it off and reports instead.
+- **What is still refused is a value that would arrive as a different value**: a
+  target column narrower than the source's, a different type, a different decimal
+  scale. Those tables are reported and skipped — the plan is built before anything is
+  written, so nothing from them lands — and `--strict` makes them stop the whole run
+  instead.
 - **`--replace` empties each table first.** Without it, a target table that already
   has rows is refused rather than added to — a container's demo data plus a tenant's
   data is neither database.
@@ -237,6 +238,19 @@ small one; `--batch-size` sets the rows per batch.
 
 A `.bak` works as a source too (`bcdb restore BusinessCentral-W1.bak --to …`),
 which is the "copy this database into that container" case.
+
+**Companies are separate tables.** BC gives every company its own copy of every
+company table (`<Company>$<Table>$<AppId>`; the 28.4 demo database has 1,987 of
+them per company) and registers the company as a row in the `Company` table, which
+has no prefix. A cloud tenant whose company is named differently from the
+container's therefore shares no table name with it: its tables are created under
+its own name and the `Company` row that registers it travels in the same restore.
+
+**Restart the service tier afterwards.** BC caches records, and a restore under a
+running NST leaves that cache disagreeing with the database — every later request
+fails with *"the field … has changed in the database between initial and JIT load"*
+until the service tier restarts. The data in SQL is correct throughout; it is the
+cache that is stale.
 
 > Note: `bcdb restore` is the only command that talks to a SQL Server. Everything
 > else in this tool still runs with no server anywhere.

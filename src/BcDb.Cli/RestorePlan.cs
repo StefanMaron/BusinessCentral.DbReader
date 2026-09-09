@@ -37,6 +37,18 @@ public sealed record TablePlan(
 {
     /// <summary>The target's own identity values are replaced by the source's, so IDENTITY_INSERT is needed.</summary>
     public bool NeedsIdentityInsert => Columns.Any(c => c.Target.IsIdentity);
+
+    /// <summary>The target has no such table; it is created from the source's schema before loading.</summary>
+    public bool CreateTable { get; init; }
+
+    /// <summary>Source columns the target's table lacks; added to it before loading.</summary>
+    public IReadOnlyList<SysColumn> AddColumns { get; init; } = Array.Empty<SysColumn>();
+
+    /// <summary>Every source column in source order, rowversion included — what CREATE TABLE emits.</summary>
+    public IReadOnlyList<SysColumn> SourceColumns { get; init; } = Array.Empty<SysColumn>();
+
+    /// <summary>The source's key columns, which become the created table's clustered primary key.</summary>
+    public IReadOnlyList<string> KeyColumns { get; init; } = Array.Empty<string>();
 }
 
 /// <summary>A source table that will not be written, and why — always reported, never silent.</summary>
@@ -64,18 +76,27 @@ public sealed record RestoreOptions
     public bool Replace { get; init; }
 
     /// <summary>
-    /// Report a table whose columns do not line up as skipped and carry on, instead of
-    /// refusing the whole restore.
+    /// Create what the target does not have: a table the source has and the target lacks,
+    /// and a column missing from a table that does exist. On by default.
     ///
-    /// The default is to refuse, and it is the right default: the plan is built before
-    /// anything is written, so a mismatch normally means the container has the wrong
-    /// version of an extension installed and the honest answer is to stop while the
-    /// database is still untouched. This exists for the case where that is known and
-    /// accepted — an export from an environment whose apps have moved on, where the rest
-    /// of the tables are still worth having. It never loads a mismatched table part way:
-    /// the table is skipped whole, with the mismatch as its reason.
+    /// This is what makes the command useful against a Business Central container. BC
+    /// keeps a table's data when its extension is uninstalled and picks the table up again
+    /// when the extension is reinstalled, so a table that exists before its owner does is
+    /// a state BC already handles — and a column or a table it does not know about is
+    /// ignored rather than resented. Creating is therefore the permissive, useful default;
+    /// --no-create turns it off for a target whose schema must not be touched.
     /// </summary>
-    public bool SkipMismatchedTables { get; init; }
+    public bool CreateMissing { get; init; } = true;
+
+    /// <summary>
+    /// Refuse the whole restore when any table cannot be reconciled, instead of reporting
+    /// that table and carrying on.
+    ///
+    /// Off by default. The plan is built before anything is written, so either way nothing
+    /// lands from a table that does not line up; the difference is whether the other 4,000
+    /// tables still load. Turn it on when a partial restore would be worse than none.
+    /// </summary>
+    public bool Strict { get; init; }
 
     /// <summary>Rows per bulk-copy batch.</summary>
     public int BatchSize { get; init; } = 10_000;
@@ -85,20 +106,26 @@ public sealed record RestoreOptions
 }
 
 /// <summary>
-/// Matches the source's tables and columns to the target database's, by name, and refuses
-/// anything that would move data inexactly.
+/// Matches the source's tables and columns to the target database's by name, creating what
+/// the target does not have, and refusing only what it cannot carry across intact.
 ///
-/// The whole point of this command is that the container's schema was made by installing
-/// the same extensions the source was exported from, so a name match is meant to be an
-/// exact schema match too. Where it is not — a column the target has no home for, a
-/// narrower target column, a different type — the restore stops and says which table and
-/// column, rather than loading a row that silently lost a field. A source table the target
-/// does not have at all is the one expected mismatch (an extension that is not installed):
-/// that one is reported and skipped, because it is the workflow's normal case and it loses
-/// nothing that was going to be written.
+/// The bias is deliberately toward getting the data in. Business Central tolerates a
+/// database that holds more than its extensions declare: a table or column nothing owns is
+/// ignored, and a table that already exists when its extension is installed is adopted
+/// rather than rejected — that is the same path an uninstall/reinstall takes, which keeps
+/// a table's data across the gap. So a table the target lacks is created from the source's
+/// own schema, and a column missing from a table that exists is added.
+///
+/// What is still refused is the case where a value would arrive as a different value: a
+/// target column narrower than the source's, a different type, a different decimal scale.
+/// Those tables are reported and skipped (or, with --strict, stop the run) — the plan is
+/// built before anything is written, so nothing from them lands either way.
 /// </summary>
 public static class RestorePlanner
 {
+    /// <summary>The reason a table filtered out by --table carries, so the report can count them rather than list them.</summary>
+    public const string FilteredOut = "not named by --table";
+
     /// <summary>Source tables whose SQL name starts with '$' are the platform's own — see <see cref="RestoreOptions.IncludeSystem"/>.</summary>
     public static bool IsSystemTable(string sqlName) => sqlName.StartsWith('$');
 
@@ -119,7 +146,7 @@ public static class RestorePlanner
         {
             if (only.Count > 0 && !only.Contains(st.Name))
             {
-                skipped.Add(new SkippedTable(st.Name, "not named by --table"));
+                skipped.Add(new SkippedTable(st.Name, FilteredOut));
                 continue;
             }
             if (!opts.IncludeSystem && IsSystemTable(st.Name))
@@ -129,19 +156,21 @@ public static class RestorePlanner
                     + "the container — pass --include-system to write it anyway"));
                 continue;
             }
-            if (!byName.TryGetValue(st.Name, out var hits))
+            byName.TryGetValue(st.Name, out var hits);
+            if (hits is null && !opts.CreateMissing)
             {
                 skipped.Add(new SkippedTable(st.Name,
-                    "no table of this name in the target database — install the extension that defines it, then restore again"));
+                    "no table of this name in the target database, and --no-create was given"));
                 continue;
             }
-            if (hits.Count > 1)
+            if (hits is { Count: > 1 })
                 throw new InvalidDataException(
                     $"the target database has {hits.Count} tables named {st.Name} "
                     + $"(schemas {string.Join(", ", hits.Select(h => h.Schema).OrderBy(x => x, StringComparer.Ordinal))}) "
                     + "— refusing to guess which one the source's rows belong in");
-            try { plans.Add(BuildTable(source, st, hits[0])); }
-            catch (InvalidDataException ex) when (opts.SkipMismatchedTables)
+            try { plans.Add(BuildTable(source, st, hits?[0], opts)); }
+            catch (InvalidDataException) when (opts.Strict) { throw; }
+            catch (InvalidDataException ex)
             {
                 skipped.Add(new SkippedTable(st.Name, ex.Message));
             }
@@ -149,38 +178,57 @@ public static class RestorePlanner
         return (plans, skipped);
     }
 
-    static TablePlan BuildTable(IBcSource source, SourceTable st, TargetTable tt)
+    /// <summary>
+    /// The plan for one table. <paramref name="existing"/> is null when the target has no
+    /// such table and it is to be created.
+    /// </summary>
+    static TablePlan BuildTable(IBcSource source, SourceTable st, TargetTable? existing, RestoreOptions opts)
     {
+        var srcCols = source.Columns(st);
+        var keyColumns = source.RowKeyColumns(st);
+        bool create = existing is null;
+        var tt = existing ?? new TargetTable("dbo", st.Name, Array.Empty<TargetColumn>());
+
         var mappings = new List<ColumnMapping>();
+        var addColumns = new List<SysColumn>();
+        var columns = tt.Columns.ToList();
         var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var sc in source.Columns(st))
+        foreach (var sc in srcCols)
         {
             // A rowversion in the source is not data: the engine that wrote it stamped it,
-            // and the engine receiving these rows will stamp its own.
+            // and the engine receiving these rows will stamp its own. It is still part of
+            // the table's shape, so a created table gets one.
             if (sc.XType == 189) continue;
 
-            var hit = tt.Columns.FirstOrDefault(c => c.Name.Equals(sc.Name, StringComparison.OrdinalIgnoreCase));
+            var hit = columns.FirstOrDefault(c => c.Name.Equals(sc.Name, StringComparison.OrdinalIgnoreCase));
             if (hit is null)
-                throw new InvalidDataException(
-                    $"{st.Name}.{sc.Name} ({TypeText(sc)}) has no column in target table {tt.QuotedName} — "
-                    + "refusing to load rows that would silently lose it; the target's schema is at a different "
-                    + "version of the extension that defines this table");
-            if (hit.IsRowVersion)
+            {
+                if (!opts.CreateMissing)
+                    throw new InvalidDataException(
+                        $"{st.Name}.{sc.Name} ({TypeText(sc)}) has no column in target table {tt.QuotedName}, "
+                        + "and --no-create was given — refusing to load rows that would silently lose it");
+                hit = Synthesize(sc, columns.Count + 1);
+                columns.Add(hit);
+                if (!create) addColumns.Add(sc);
+            }
+            else if (hit.IsRowVersion)
+            {
                 throw new InvalidDataException(
                     $"{st.Name}.{sc.Name} is {TypeText(sc)} in the source and a rowversion in the target — "
                     + "a rowversion cannot be written, so this column's values have nowhere to go");
+            }
             // A computed target column derives its own value from the columns around it;
             // not writing it loses nothing.
-            if (hit.IsComputed) continue;
+            else if (hit.IsComputed) continue;
+            else CheckCompatible(st.Name, sc, hit);
 
-            CheckCompatible(st.Name, sc, hit);
             mappings.Add(new ColumnMapping(sc, hit));
             mapped.Add(hit.Name);
         }
 
         var targetOnly = new List<string>();
-        foreach (var tc in tt.Columns)
+        foreach (var tc in columns)
         {
             if (mapped.Contains(tc.Name) || !tc.IsWritable) continue;
             if (tc.IsIdentity || tc.IsNullable || tc.HasDefault) { targetOnly.Add(tc.Name); continue; }
@@ -189,8 +237,20 @@ public static class RestorePlanner
                 + $"{st.Name} has no column of that name — every row would be rejected, so the load stops here "
                 + "rather than part way through");
         }
-        return new TablePlan(st, tt, mappings, targetOnly);
+
+        return new TablePlan(st, tt with { Columns = columns }, mappings, targetOnly)
+        {
+            CreateTable = create,
+            AddColumns = addColumns,
+            SourceColumns = srcCols,
+            KeyColumns = keyColumns,
+        };
     }
+
+    /// <summary>The target column a source column becomes when the target has to grow one.</summary>
+    static TargetColumn Synthesize(SysColumn c, int ordinal) => new(
+        c.Name, ordinal, c.TypeName, c.MaxLength, c.Precision, c.Scale,
+        IsNullable: c.IsNullable, IsIdentity: false, IsComputed: false, HasDefault: false);
 
     /// <summary>
     /// Refuses any mapping that would not carry every value across intact. Widening is

@@ -103,21 +103,23 @@ public static class Program
                                                               "merge-extensions": ..}; one JSON response line each. A key the command
                                                               does not accept fails the request instead of being ignored.)
               bcdb verify <file> --fixture <fixture.tsv> --table <name> --select "A,B"
-              bcdb restore <file> --to "<connection string>" [--replace] [--dry-run] [--table "A,B"] [--include-system] [--batch-size N]
+              bcdb restore <file> --to "<connection string>" [--replace] [--dry-run] [--table "A,B"] [--include-system] [--no-create] [--strict] [--batch-size N]
                                                              write the source's rows into a database that already
-                                                             exists — a BC container with the matching extensions
-                                                             already installed. Tables are matched by name; one the
-                                                             target does not have is reported and skipped, while a
-                                                             column mismatch inside a matched table stops the load.
-                                                             --replace empties each table first (without it a
-                                                             non-empty target is refused); --dry-run prints the plan
-                                                             and writes nothing; --include-system also writes the
-                                                             platform's own $ndo$... tables, which normally belong to
-                                                             the container. --skip-mismatched reports a table whose
-                                                             columns do not line up and carries on, instead of
-                                                             refusing the whole restore before writing anything.
-                                                             A container's certificate is self-signed,
-                                                             so the connection string needs TrustServerCertificate=True.
+                                                             exists — a BC container with its extensions installed.
+                                                             Tables and columns are matched by name; a table or
+                                                             column the target does not have is CREATED from the
+                                                             source's own schema, because BC ignores what its
+                                                             extensions do not declare and adopts a table that is
+                                                             already there. --no-create turns that off and reports
+                                                             instead. --replace empties each table first (without it
+                                                             a non-empty target is refused); --dry-run prints the
+                                                             plan and writes nothing; --include-system also writes
+                                                             the platform's own $ndo$... tables, which normally
+                                                             belong to the container; --strict stops the whole
+                                                             restore on a table that cannot be reconciled instead of
+                                                             reporting it and carrying on. A container's certificate
+                                                             is self-signed, so the connection string needs
+                                                             TrustServerCertificate=True.
               bcdb --version                                      version, platform and build flavor
             check and validate are page-map commands and need a .bak.
             --prefetch works with any command. An option the command does not accept fails
@@ -154,7 +156,7 @@ public static class Program
         ["read"] = ReadOpts,
         ["verify"] = ReadOpts.Concat(new[] { "fixture" }).ToArray(),
         ["serve"] = new[] { "symbols" },
-        ["restore"] = new[] { "to", "replace", "dry-run", "batch-size", "table", "include-system", "skip-mismatched" },
+        ["restore"] = new[] { "to", "replace", "dry-run", "batch-size", "table", "include-system", "no-create", "strict" },
     };
 
     /// <summary>Accepted by every subcommand: it is applied when the file is opened.</summary>
@@ -162,7 +164,7 @@ public static class Program
 
     /// <summary>Options that are switches — they take no value.</summary>
     static readonly HashSet<string> ValuelessOpts = new(StringComparer.Ordinal)
-        { "prefetch", "merge-extensions", "replace", "dry-run", "include-system", "skip-mismatched" };
+        { "prefetch", "merge-extensions", "replace", "dry-run", "include-system", "no-create", "strict" };
 
     /// <summary>
     /// The command line's options for one subcommand.

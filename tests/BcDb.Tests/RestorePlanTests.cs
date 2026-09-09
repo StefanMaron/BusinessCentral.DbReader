@@ -21,6 +21,9 @@ public class RestorePlanTests : IDisposable
     public void Dispose() => _src.Dispose();
 
     static readonly RestoreOptions Default = new();
+    static readonly RestoreOptions Strict = new() { Strict = true };
+    static readonly RestoreOptions NoCreate = new() { CreateMissing = false };
+    static readonly RestoreOptions NoCreateStrict = new() { CreateMissing = false, Strict = true };
 
     (IReadOnlyList<TablePlan> Tables, IReadOnlyList<SkippedTable> Skipped) Build(
         List<TargetTable> target, RestoreOptions? opts = null)
@@ -69,14 +72,44 @@ public class RestorePlanTests : IDisposable
     }
 
     [Fact]
-    public void ATableTheTargetDoesNotHaveIsSkippedByNameWithAReason()
+    public void ATableTheTargetDoesNotHaveIsCreatedFromTheSourcesOwnSchema()
     {
-        // The expected mismatch: an extension the container has not installed. It is
-        // reported, not fatal — but it is never silent.
+        // BC keeps a table's data when its extension is uninstalled and adopts the table
+        // again on reinstall, so a table that exists before its owner does is a state BC
+        // already handles. Creating it is therefore the useful default.
         var target = MirrorAll().Where(t => t.Name != "probe_notnull").ToList();
-        var skipped = Build(target).Skipped.Single(s => s.Name == "probe_notnull");
+        var plan = PlanFor(target, "probe_notnull");
+
+        Assert.True(plan.CreateTable);
+        Assert.Equal("[dbo].[probe_notnull]", plan.Target.QuotedName);
+        Assert.Equal(new[] { "id" }, plan.KeyColumns);
+        // Every source column is in the DDL, the rowversion included — it is part of the
+        // table's shape even though no value is ever written to it.
+        Assert.Contains(plan.SourceColumns, c => c.Name == "n_ver" && c.TypeName == "timestamp");
+        Assert.Equal(27, plan.SourceColumns.Count);
+        // …but it is still not written.
+        Assert.DoesNotContain(plan.Columns, c => c.Target.Name == "n_ver");
+        Assert.Equal(26, plan.Columns.Count);
+    }
+
+    [Fact]
+    public void CreatedColumnsCarryTheSourcesNullability()
+    {
+        var target = MirrorAll().Where(t => t.Name != "probe").ToList();
+        var plan = PlanFor(target, "probe");
+        // tools/typeprobe.sql: probe.id is NOT NULL, every other column is nullable.
+        Assert.False(plan.SourceColumns.Single(c => c.Name == "id").IsNullable);
+        Assert.True(plan.SourceColumns.Single(c => c.Name == "c_nvarchar").IsNullable);
+    }
+
+    [Fact]
+    public void WithNoCreateAMissingTableIsSkippedByNameWithAReason()
+    {
+        var target = MirrorAll().Where(t => t.Name != "probe_notnull").ToList();
+        var skipped = Build(target, NoCreate).Skipped.Single(s => s.Name == "probe_notnull");
         Assert.Contains("no table", skipped.Reason, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain(Build(target).Tables, p => p.Source.Name == "probe_notnull");
+        Assert.Contains("--no-create", skipped.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain(Build(target, NoCreate).Tables, p => p.Source.Name == "probe_notnull");
     }
 
     [Fact]
@@ -102,28 +135,29 @@ public class RestorePlanTests : IDisposable
     }
 
     [Fact]
-    public void ASourceColumnWithNoTargetColumnIsRefused()
+    public void ASourceColumnTheTargetTableLacksIsAddedToIt()
     {
-        // Loading the other 25 columns and dropping this one would produce rows that look
-        // complete. The tool stops and names the column instead.
         var target = MirrorAll().Replace(RestoreTestSchema.Mirror(_src, "probe_notnull").With("n_nvarchar", null));
-        var ex = Assert.Throws<InvalidDataException>(() => Build(target));
-        Assert.Contains("probe_notnull", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("n_nvarchar", ex.Message, StringComparison.Ordinal);
+        var plan = PlanFor(target, "probe_notnull");
+
+        Assert.False(plan.CreateTable);                       // the table itself was there
+        Assert.Equal(new[] { "n_nvarchar" }, plan.AddColumns.Select(c => c.Name));
+        Assert.Contains(plan.Columns, c => c.Target.Name == "n_nvarchar");   // and it is written
+        Assert.Equal(26, plan.Columns.Count);
     }
 
     [Fact]
-    public void WithSkipMismatchedTheMismatchedTableIsSkippedAndTheRestStillPlanned()
+    public void WithNoCreateAMissingColumnIsRefusedRatherThanDropped()
     {
-        // The escape hatch, and its shape matters: the table is skipped whole, carrying
-        // the mismatch as its reason, and no half-mapped plan for it exists.
+        // Loading the other 25 columns and dropping this one would produce rows that look
+        // complete. Without --create the tool names the column instead.
         var target = MirrorAll().Replace(RestoreTestSchema.Mirror(_src, "probe_notnull").With("n_nvarchar", null));
-        var plan = Build(target, new RestoreOptions { SkipMismatchedTables = true });
-
-        var skipped = plan.Skipped.Single(s => s.Name == "probe_notnull");
+        var skipped = Build(target, NoCreate).Skipped.Single(s => s.Name == "probe_notnull");
         Assert.Contains("n_nvarchar", skipped.Reason, StringComparison.Ordinal);
-        Assert.DoesNotContain(plan.Tables, p => p.Source.Name == "probe_notnull");
-        Assert.Contains(plan.Tables, p => p.Source.Name == "probe_dense");
+
+        var ex = Assert.Throws<InvalidDataException>(() => Build(target, NoCreateStrict));
+        Assert.Contains("probe_notnull", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("n_nvarchar", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -133,7 +167,10 @@ public class RestorePlanTests : IDisposable
         var nv = t.Columns.Single(c => c.Name == "n_nvarchar");
         Assert.Equal(200, nv.MaxLength);                                  // nvarchar(100) = 200 bytes
         var target = MirrorAll().Replace(t.With("n_nvarchar", nv with { MaxLength = 100 }));
-        var ex = Assert.Throws<InvalidDataException>(() => Build(target));
+        // Reported and skipped by default, fatal under --strict — either way nothing lands.
+        Assert.Contains("n_nvarchar", Build(target).Skipped.Single(x => x.Name == "probe_notnull").Reason);
+        Assert.DoesNotContain(Build(target).Tables, p => p.Source.Name == "probe_notnull");
+        var ex = Assert.Throws<InvalidDataException>(() => Build(target, Strict));
         Assert.Contains("n_nvarchar", ex.Message, StringComparison.Ordinal);
         Assert.Contains("nvarchar(100)", ex.Message, StringComparison.Ordinal);   // the source's width
         Assert.Contains("nvarchar(50)", ex.Message, StringComparison.Ordinal);    // the target's
@@ -154,7 +191,8 @@ public class RestorePlanTests : IDisposable
         var t = RestoreTestSchema.Mirror(_src, "probe_notnull");
         var i = t.Columns.Single(c => c.Name == "n_int");
         var target = MirrorAll().Replace(t.With("n_int", i with { TypeName = "bigint", MaxLength = 8 }));
-        var ex = Assert.Throws<InvalidDataException>(() => Build(target));
+        Assert.DoesNotContain(Build(target).Tables, p => p.Source.Name == "probe_notnull");
+        var ex = Assert.Throws<InvalidDataException>(() => Build(target, Strict));
         Assert.Contains("n_int", ex.Message, StringComparison.Ordinal);
         Assert.Contains("int", ex.Message, StringComparison.Ordinal);
         Assert.Contains("bigint", ex.Message, StringComparison.Ordinal);
@@ -176,7 +214,7 @@ public class RestorePlanTests : IDisposable
         var t = RestoreTestSchema.Mirror(_src, "probe_notnull");
         var d = t.Columns.Single(c => c.Name == "n_dec38_20");
         var target = MirrorAll().Replace(t.With("n_dec38_20", d with { Scale = 2 }));
-        var ex = Assert.Throws<InvalidDataException>(() => Build(target));
+        var ex = Assert.Throws<InvalidDataException>(() => Build(target, Strict));
         Assert.Contains("n_dec38_20", ex.Message, StringComparison.Ordinal);
         Assert.Contains("decimal(38,20)", ex.Message, StringComparison.Ordinal);
         Assert.Contains("decimal(38,2)", ex.Message, StringComparison.Ordinal);
@@ -189,7 +227,7 @@ public class RestorePlanTests : IDisposable
         var d = t.Columns.Single(c => c.Name == "n_dec38_20");
         var target = MirrorAll().Replace(t.With("n_dec38_20", d with { Precision = 30 }));
         Assert.Contains("n_dec38_20",
-            Assert.Throws<InvalidDataException>(() => Build(target)).Message, StringComparison.Ordinal);
+            Assert.Throws<InvalidDataException>(() => Build(target, Strict)).Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -202,7 +240,7 @@ public class RestorePlanTests : IDisposable
         var target = MirrorAll().Replace(t.Plus(new TargetColumn(
             "extra_required", 99, "int", 4, 10, 0,
             IsNullable: false, IsIdentity: false, IsComputed: false, HasDefault: false)));
-        var ex = Assert.Throws<InvalidDataException>(() => Build(target));
+        var ex = Assert.Throws<InvalidDataException>(() => Build(target, Strict));
         Assert.Contains("extra_required", ex.Message, StringComparison.Ordinal);
         Assert.Contains("probe_notnull", ex.Message, StringComparison.Ordinal);
     }
@@ -246,6 +284,7 @@ public class RestorePlanTests : IDisposable
         var t = RestoreTestSchema.Mirror(_src, "probe_notnull");
         var target = MirrorAll();
         target.Add(t with { Schema = "other" });
+        // Ambiguity is fatal whatever the mode: there is no safe guess about which one.
         var ex = Assert.Throws<InvalidDataException>(() => Build(target));
         Assert.Contains("probe_notnull", ex.Message, StringComparison.Ordinal);
         Assert.Contains("dbo", ex.Message, StringComparison.Ordinal);

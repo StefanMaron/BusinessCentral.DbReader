@@ -26,6 +26,10 @@ Q "$ASEL,'|#') FROM probe_altered_page ORDER BY id" > "$FIX/typeprobe-probe-alte
 Q "SELECT CONCAT(CAST(id AS varchar(max)),'|',ISNULL(txt,N'NULL'),'|',ISNULL(CONVERT(varchar(30),amt),'NULL'),'|#') FROM probe_heap ORDER BY id" > "$FIX/typeprobe-probe-heap.tsv"
 Q "SELECT CONCAT(CAST(id AS varchar(max)),'|',ISNULL(CONVERT(varchar(36),g),'NULL'),'|',ISNULL(txt,N'NULL'),'|',ISNULL(CONVERT(varchar(30),amt),'NULL'),'|#') FROM probe_tracked ORDER BY id" > "$FIX/typeprobe-probe-tracked.tsv"
 Q "SELECT CONCAT(CAST(id AS varchar(max)),'|',$IMG,'|',ISNULL(CONVERT(varchar(max),c_text),'NULL'),'|#') FROM probe_lob_upd ORDER BY id" > "$FIX/typeprobe-probe-lob-upd.tsv"
+# Nullability of every column of every user table. Invisible in a .bak record (the null
+# bitmap carries a bit either way) and irrelevant to reading, but `bcdb restore` recreates
+# tables from it, so it is derived from syscolpars.status and checked against this.
+Q "SELECT CONCAT(t.name,'|',c.name,'|',CAST(c.is_nullable AS int),'|#') FROM sys.columns c JOIN sys.tables t ON t.object_id=c.object_id WHERE t.is_ms_shipped=0 ORDER BY t.name, c.column_id" > "$FIX/typeprobe-nullability.tsv"
 Q "SELECT CONCAT(CAST(id AS varchar(max)),'|',ISNULL([pad ],N'NULL'),'|',ISNULL([ pad],N'NULL'),'|',ISNULL(CONVERT(varchar(30),amt),'NULL'),'|#') FROM probe_oddnames ORDER BY id" > "$FIX/typeprobe-probe-oddnames.tsv"
 # probe_notnull: every type as NOT NULL. n_real/n_float are exercised by the framing but
 # left out here — SQL Server's float-to-string form is not .NET's round-trip form; the

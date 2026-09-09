@@ -40,7 +40,16 @@ public static class SqlRestore
         var target = ReadSchema(cn);
         var (plans, skipped) = RestorePlanner.Build(src, target, opts);
 
-        foreach (var s in skipped) log.WriteLine($"skip  {s.Name}: {s.Reason}");
+        // A table left out by --table is not news — the caller asked for that — so it is
+        // counted rather than listed. On a BC database that is 4,000 lines of noise around
+        // the one line that matters.
+        int filtered = 0;
+        foreach (var s in skipped)
+        {
+            if (s.Reason == RestorePlanner.FilteredOut) { filtered++; continue; }
+            log.WriteLine($"skip  {s.Name}: {s.Reason}");
+        }
+        if (filtered > 0) log.WriteLine($"skip  {filtered} tables not named by --table");
         if (plans.Count == 0)
             throw new InvalidDataException(
                 $"none of the source's {src.Tables.Count} tables matched a table in {cn.Database} — "
@@ -48,6 +57,8 @@ public static class SqlRestore
                 + "installed, and that the company names match (a cloud tenant's company is part of every table name).");
         foreach (var p in plans)
             log.WriteLine($"plan  {p.Source.Name} -> {p.Target.QuotedName}: {p.Columns.Count} columns"
+                + (p.CreateTable ? ", creating the table" : "")
+                + (p.AddColumns.Count > 0 ? $", adding {string.Join(", ", p.AddColumns.Select(c => c.Name))}" : "")
                 + (p.TargetOnlyColumns.Count > 0 ? $", leaving {string.Join(", ", p.TargetOnlyColumns)} to the target" : "")
                 + (p.NeedsIdentityInsert ? ", keeping the source's identity values" : ""));
 
@@ -144,11 +155,30 @@ public static class SqlRestore
 
     static TableLoad LoadTable(SqlConnection cn, IBcSource src, TablePlan p, RestoreOptions opts, TextWriter log)
     {
-        if (opts.Replace) Empty(cn, p.Target, log);
-        else
+        if (p.CreateTable)
         {
-            using var probe = new SqlCommand($"SELECT TOP 1 1 FROM {p.Target.QuotedName}", cn) { CommandTimeout = 120 };
-            if (probe.ExecuteScalar() != null)
+            Execute(cn, RestoreDdl.CreateTable(p.Target, p.SourceColumns, p.KeyColumns));
+            log.WriteLine($"create {p.Target.QuotedName}: {p.SourceColumns.Count} columns"
+                + (p.KeyColumns.Count > 0 ? $", key ({string.Join(", ", p.KeyColumns)})" : ", no key"));
+        }
+        else if (p.AddColumns.Count > 0)
+        {
+            bool empty = !HasRows(cn, p.Target);
+            foreach (var c in p.AddColumns)
+            {
+                Execute(cn, RestoreDdl.AddColumn(p.Target, c, empty));
+                // Said out loud: a column the source declares NOT NULL lands NULLable on a
+                // table that already has rows, because SQL Server cannot do otherwise
+                // without inventing a default for the rows already there.
+                log.WriteLine($"alter {p.Target.QuotedName}: added {c.Name} {RestoreDdl.TypeText(c)}"
+                    + (!c.IsNullable && !empty ? " as NULL (the table already has rows)" : ""));
+            }
+        }
+
+        if (opts.Replace) Empty(cn, p.Target, log);
+        else if (!p.CreateTable)
+        {
+            if (HasRows(cn, p.Target))
                 throw new InvalidDataException(
                     $"{p.Target.QuotedName} already has rows — pass --replace to empty every table this restore "
                     + "writes, or leave this one out with --table. Adding the source's rows to the ones already "
@@ -188,6 +218,18 @@ public static class SqlRestore
         sw.Stop();
         log.WriteLine($"load  {p.Source.Name}: {reader.RowsRead} rows in {sw.ElapsedMilliseconds} ms");
         return new TableLoad(p.Source.Name, reader.RowsRead, sw.Elapsed);
+    }
+
+    static bool HasRows(SqlConnection cn, TargetTable t)
+    {
+        using var probe = new SqlCommand($"SELECT TOP 1 1 FROM {t.QuotedName}", cn) { CommandTimeout = 120 };
+        return probe.ExecuteScalar() != null;
+    }
+
+    static void Execute(SqlConnection cn, string sql)
+    {
+        using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 0 };
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>
@@ -236,7 +278,8 @@ public static class RestoreCommand
             OnlyTables = only,
             IncludeSystem = opts.ContainsKey("include-system"),
             Replace = opts.ContainsKey("replace"),
-            SkipMismatchedTables = opts.ContainsKey("skip-mismatched"),
+            CreateMissing = !opts.ContainsKey("no-create"),
+            Strict = opts.ContainsKey("strict"),
             DryRun = opts.ContainsKey("dry-run"),
             BatchSize = batch,
         };

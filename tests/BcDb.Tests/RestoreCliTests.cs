@@ -18,13 +18,14 @@ public class RestoreCliTests
         var o = Program.ParseOpts(new[]
         {
             "--to", "Server=localhost;Database=CRONUS;", "--replace", "--dry-run",
-            "--include-system", "--skip-mismatched", "--batch-size", "5000", "--table", "a,b",
+            "--include-system", "--no-create", "--strict", "--batch-size", "5000", "--table", "a,b",
         }, "restore");
         Assert.Equal("Server=localhost;Database=CRONUS;", o["to"]);
         Assert.Equal("true", o["replace"]);
         Assert.Equal("true", o["dry-run"]);
         Assert.Equal("true", o["include-system"]);
-        Assert.Equal("true", o["skip-mismatched"]);
+        Assert.Equal("true", o["no-create"]);
+        Assert.Equal("true", o["strict"]);
         Assert.Equal("5000", o["batch-size"]);
         Assert.Equal("a,b", o["table"]);
     }
@@ -62,14 +63,15 @@ public class RestoreCliTests
         var opts = RestoreCommand.OptionsFrom(Program.ParseOpts(new[]
         {
             "--to", "Server=tcp:localhost,1433;Database=CRONUS;", "--replace", "--dry-run",
-            "--include-system", "--skip-mismatched", "--batch-size", "250", "--table", " probe_dense , probe_notnull ",
+            "--include-system", "--no-create", "--strict", "--batch-size", "250", "--table", " probe_dense , probe_notnull ",
         }, "restore"), out var connection);
 
         Assert.Equal("Server=tcp:localhost,1433;Database=CRONUS;", connection);
         Assert.True(opts.Replace);
         Assert.True(opts.DryRun);
         Assert.True(opts.IncludeSystem);
-        Assert.True(opts.SkipMismatchedTables);
+        Assert.False(opts.CreateMissing);
+        Assert.True(opts.Strict);
         Assert.Equal(250, opts.BatchSize);
         Assert.Equal(new[] { "probe_dense", "probe_notnull" }, opts.OnlyTables);
     }
@@ -82,7 +84,8 @@ public class RestoreCliTests
         Assert.False(opts.Replace);          // a non-empty target is refused, never appended to
         Assert.False(opts.DryRun);
         Assert.False(opts.IncludeSystem);    // $ndo$... tables belong to the container
-        Assert.False(opts.SkipMismatchedTables);  // a schema mismatch stops the restore before it writes
+        Assert.True(opts.CreateMissing);     // a table the container lacks is created, not refused
+        Assert.False(opts.Strict);           // one unreconcilable table does not stop the other 4,000
         Assert.Empty(opts.OnlyTables);
         Assert.True(opts.BatchSize > 0);
     }
