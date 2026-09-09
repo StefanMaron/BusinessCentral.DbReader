@@ -29,7 +29,17 @@
     <PackageTags>business-central;dynamics-365;sql-server;backup;bak;bacpac;cli;dotnet-tool</PackageTags>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!--
+      Not invariant, and it cannot be: Microsoft.Data.SqlClient refuses to initialise under
+      Globalization Invariant Mode ("Globalization Invariant Mode is not supported.", thrown
+      before a connection is even attempted), so `bcdb restore` could not open a connection
+      while this was true. The cost is that the Linux build now needs ICU present on the
+      host, the way any other non-invariant .NET application does; Windows uses NLS and
+      macOS ships ICU, so only Linux can be missing it. Nothing in the reading path depends
+      on a culture — every decoder formats with InvariantCulture explicitly — so this
+      changes what the binary links against, not what it answers.
+    -->
+    <InvariantGlobalization>false</InvariantGlobalization>
     <!--
       Publish native: a one-shot `bcdb read` is a short process, and on a warm file most
       of its wall clock was runtime startup and JIT rather than work. Measured on the BC
@@ -51,6 +61,33 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../BcDb.Core/BcDb.Core.csproj" />
+    <!--
+      `bcdb restore` writes rows into a database that already exists (a BC container), and
+      SqlBulkCopy is the only way to do that at the volumes a BC database comes in. The
+      dependency lives here and not in BcDb.Core on purpose: the library's promise is
+      reading a file with no SQL Server anywhere, and a consumer that only wants to read
+      should not acquire a database client to do it.
+
+      Publishing this project Native AOT emits IL2104 ("Microsoft.Data.SqlClient produced
+      trim warnings") — the package is not fully trim-annotated. The publish succeeds and
+      the resulting binary connects and bulk-copies; the warning is left visible rather
+      than suppressed, because it is the honest state of the dependency.
+    -->
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Managed networking on Windows too. On Windows the client otherwise talks to the
+      server through a native Microsoft.Data.SqlClient.SNI.dll, which the publish copies
+      next to bcdb.exe rather than into it — and the release asset is one file, so a
+      downloaded bcdb.exe would have found no SNI at the moment somebody ran `restore`.
+      The managed implementation is the same one every non-Windows platform already uses.
+      Not exercised on Windows from this machine; the win-x64 leg of the release workflow
+      is where that shows.
+    -->
+    <RuntimeHostConfigurationOption Include="Switch.Microsoft.Data.SqlClient.UseManagedNetworkingOnWindows"
+                                    Value="true" Trim="true" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />

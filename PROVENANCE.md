@@ -797,6 +797,107 @@ Value encodings, relative to the storage forms the `.bak` reader already decodes
   so a column whose SQL name has a trailing space — BC has them — cannot be addressed by
   `--select` in either container, though a `read` without `--select` still returns it.
 
+## Writing rows back: `bcdb restore` (`RestorePlan.cs`, `RestoreValues.cs`, `SqlRestore.cs`)
+
+The one command that writes. It carries a source's rows into a database that already
+exists — a BC container whose extensions were installed first — and nothing here is a
+file-format derivation: the target's schema is read from its own catalog views and the
+conversions are between the reader's decoded values and the CLR types SQL Server's client
+takes. What follows is therefore mostly *decisions and their evidence*, not structure.
+
+- **The target's schema comes from `sys.columns` / `sys.tables` / `sys.types` / `sys.schemas`,
+  filtered by `is_ms_shipped = 0`** — never from the source file. The source file's schema
+  describes the database it was taken from; the container's describes where the rows are
+  going, and the two differ exactly when an extension is at a different version. That is
+  the case the plan exists to catch.
+- **Matching is by name, tables and columns alike, case-insensitively** (SQL Server's own
+  identifier comparison for a case-insensitive collation). The same name in two schemas
+  throws rather than picking one.
+- **A rowversion is never written.** SQL Server rejects a supplied value for one, and it
+  is not data: `probe_notnull.n_ver` is in the source's columns and absent from every
+  plan. Confirmed against the oracle in `SqlRestoreIntegrationTests`: after a restore the
+  three rows carry three distinct server-assigned values.
+- **Identity values are preserved** (`SqlBulkCopyOptions.KeepIdentity`). A restore
+  reproduces the source's keys; letting the target renumber them would break every row
+  that references one.
+- **Constraints are not checked and triggers do not fire** during the load, which is
+  SQL Server's own default for a bulk copy. That is what makes table order irrelevant: a
+  child table may be written before its parent.
+- **`$ndo$…` tables are excluded by default.** They are the service tier's own view of
+  the database it is attached to — installed apps, tenant identity, schema version — and
+  the container has its own answers, put there by the extensions actually installed in
+  it. Writing a cloud tenant's answers over them breaks the container rather than filling
+  it with data. `--include-system` opts in; the exclusion is reported per table, never
+  silent. (`$probe$platform` in the type-probe database exercises the rule.)
+- **decimal crosses as `SqlDecimal`, fixed at the target's declared precision and scale.**
+  BC declares amounts `decimal(38,20)`, and `System.Decimal` holds 28-29 significant
+  digits: the probe database's own `99999999999999999.99999999999999999999` has 37.
+  `decimal.TryParse` does not reject it — it parses and rounds the low digits away, which
+  is the silent-wrong-value failure this project refuses. `SqlDecimal` is the 38-digit
+  type SQL Server's client uses, and the round trip is exact.
+- **Every other value's conversion is validated against the oracle without a server in
+  the room.** `probe_notnull` carries every supported type as `NOT NULL` at its extremes,
+  and `fixtures/typeprobe-probe-notnull.tsv` is that table's `SELECT` output from the
+  oracle. `RestoreValueTests` converts each cell the way the load does and renders the
+  result the way `CONVERT(varchar, …, 121)` does: all 3 rows × 24 columns reproduce the
+  fixture exactly. A rounded decimal, a dropped fractional second, a truncated blob or a
+  lost code point would show as a differing field.
+- **That the rows land is verified against a real server**, in `SqlRestoreIntegrationTests`:
+  the type-probe backup is written into a scratch database and read back with the
+  fixture's own `SELECT`, compared against the same fixture. It needs a server, so it is
+  a `SkippableFact` gated on `BCDB_RESTORE_SQL`, and `verify.sh` both passes the oracle in
+  and fails if the tests report as skipped there.
+- **Mismatches refuse rather than approximate.** A source column with no target column, a
+  narrower or differently-typed target column, a different decimal scale or lower
+  precision, a `NOT NULL` target column with no default and no source column: each throws
+  naming the table and column. Widening is accepted (a target `nvarchar(200)` holds
+  everything an `nvarchar(100)` did), `decimal` and `numeric` are the same type, and a
+  computed target column is skipped because it derives its own value. A source *table* the
+  target does not have is the one expected mismatch — an extension that is not installed —
+  and it is reported and skipped, because nothing that was going to be written is lost.
+  The whole plan is built before any write, so a refusal leaves the target untouched;
+  `--skip-mismatched` turns a column mismatch into a whole-table skip carrying the
+  mismatch as its reason, for exports whose apps have moved on, and never loads such a
+  table part way.
+- **A non-empty target table is refused without `--replace`.** Adding a tenant's rows to a
+  container's demo data gives a database that is neither. With `--replace` each table is
+  emptied first: `TRUNCATE`, falling back to `DELETE` (reported, not silent) where a
+  foreign key refers to the table.
+
+### Consequences for the shipped binary, measured
+
+- **`InvariantGlobalization` had to be turned off.** `Microsoft.Data.SqlClient` throws
+  "Globalization Invariant Mode is not supported." during initialisation, before a
+  connection is attempted — the AOT binary reported exactly that in place of a connection
+  error. Nothing in the reading path depends on a culture (every decoder formats with
+  `InvariantCulture` explicitly), so this changes what the binary links against, not what
+  it answers. On Linux the binary now needs ICU present; Windows uses NLS and macOS ships
+  ICU.
+- **Cost of the dependency**, Native AOT, linux-x64, warm, median of 9 runs, measured on
+  the container this was developed in (so comparable to each other, not to the README's
+  demo-backup numbers): binary 9.57 MB → 25.92 MB; startup floor (`--version`)
+  6.0 ms → 10.0 ms; one-shot `read` of `probe_dense` from `typeprobe.bak` 21.0 ms →
+  26.0 ms. The read path pays that on every invocation for a command most callers never
+  use — worth revisiting if the reader's startup budget matters more than one binary does.
+- **Managed networking is forced on Windows**
+  (`Switch.Microsoft.Data.SqlClient.UseManagedNetworkingOnWindows`, the switch name read
+  off the strings of `runtimes/win/lib/net8.0/Microsoft.Data.SqlClient.dll`, and confirmed
+  landing in `bcdb.runtimeconfig.json`). On Windows the client otherwise reaches the
+  server through a native `Microsoft.Data.SqlClient.SNI.dll`, which a publish places
+  *next to* the binary rather than inside it — and the release asset is a single file, so
+  a downloaded `bcdb.exe` would have had no SNI at the moment somebody ran `restore`. The
+  managed implementation is the one every non-Windows platform already uses. Not
+  exercised on Windows from the machine this was written on; the win-x64 release leg is
+  where it shows.
+- **`IDataRecord.GetFieldType`'s return value is annotated
+  `DynamicallyAccessedMembers(PublicFields | PublicProperties)`** (value 544, read off the
+  .NET 8 reference assembly by reflection); an override must carry the identical
+  annotation or the AOT analyser rejects it with IL2093, and this project builds warnings
+  as errors. Publishing AOT still emits IL2104/IL3053 for `Microsoft.Data.SqlClient`
+  itself, which is not trim-annotated. The publish succeeds and the binary connects; the
+  warning is left visible rather than suppressed, because it is the honest state of the
+  dependency.
+
 ## BC version differences observed (27.5 vs 28.1)
 - 28.1 demo databases contain a second company, `My Company`, with populated tables
   (27.5 W1 has only `CRONUS International Ltd_`). Table resolution needs `--company`.

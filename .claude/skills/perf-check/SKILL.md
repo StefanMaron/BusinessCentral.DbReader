@@ -54,6 +54,15 @@ silently invents or hides regressions.
 | Resident after a cold one-shot `read` | — | **50 MB** |
 | Sequential read of the whole file, cold / warm | 0.38 s / 0.03 s | |
 
+**`bcdb restore` moved the native floor.** Adding `Microsoft.Data.SqlClient` (and, with
+it, turning `InvariantGlobalization` off — the client refuses to initialise under it)
+costs every command, including the ones that never touch a server. Measured on the
+container the restore work was done in, so these two columns compare only with each
+other and not with the table above: binary 9.57 MB → 25.92 MB, startup floor
+(`--version`) 6.0 ms → 10.0 ms, warm one-shot `read` of `probe_dense` from
+`typeprobe.bak` 21.0 ms → 26.0 ms (native AOT, median of 9). Re-measure the table above
+on the reference machine before quoting it again.
+
 In process, steady state (a loop of 15, so no JIT and no process start):
 
 | Phase | Time | Allocation |

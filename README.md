@@ -9,6 +9,12 @@ directly from the file. For a `.bacpac` it reads the zip container, the `model.x
 schema, and the native bulk-copy data streams. Both paths answer the same commands
 and produce the same output, so which file you have only changes the path you pass.
 
+One command goes the other way: `bcdb restore` writes those rows into a database
+that already exists — a Business Central container with its extensions installed —
+so a cloud export becomes a working local environment without a tenant mount or a
+`sqlpackage` import. Reading still needs no SQL Server anywhere; only `restore` does,
+and only as the destination.
+
 Any Business Central database file is the target: the format work — pages, the
 system catalog, row/page compression, LOB storage, BCP row framing — is the same in
 a customer's production file as in Microsoft's demo databases. What has actually
@@ -96,6 +102,7 @@ bcdb companies <file>                         list the companies in the database
 bcdb read     <file> --table <name> [options] decode rows to pipe-separated text or JSON
 bcdb describe <file> --table <name> --symbols <apps>   AL schema: field ids, AL types, SQL columns
 bcdb serve    <file> [--symbols <apps>]       open once, answer many requests over stdin/stdout
+bcdb restore  <file> --to "<connection>"      write the rows into an existing database (a BC container)
 bcdb check    <file.bak>                      cross-check the page map; prints map statistics
 bcdb verify   <file> --fixture <f.tsv> ...    compare decoded rows against a fixture file
 bcdb --version                                version, platform and build flavor
@@ -177,6 +184,62 @@ Two differences are worth knowing:
   storage compression to report.
 - Row counts are counted, not read from a catalog, so `bcdb tables` on a large
   export reads the whole file. `read` and `describe` only touch the table asked for.
+
+### Restoring a cloud export into a container
+
+Reading is one half of what a cloud export is wanted for; the other is getting the
+data into a container so a service tier can serve it. `bcdb restore` writes the
+rows straight into a database that already exists — no tenant mount, no service
+tier, no `sqlpackage` import:
+
+```
+# 1. start a container and install the extensions the data came from, as usual
+# 2. push the data in
+bcdb restore MyEnvironment.bacpac --replace \
+    --to "Server=localhost;Database=CRONUS;User ID=sa;Password=…;TrustServerCertificate=True"
+```
+
+The container's schema is the authority. Installing the extensions is what creates
+the tables; this only carries rows into them, matching source table to target table
+by SQL name, and column to column by name. That division is what makes it work with
+AppSource apps: whatever the container's apps declare is what the data lands in.
+
+What it does, and refuses to do:
+
+- **A table the target does not have is reported and skipped.** That is the normal
+  case — an extension that is not installed — and it costs nothing that was going
+  to be written.
+- **A column mismatch inside a matched table stops the load**, naming the table and
+  column: a source column with no target column, a narrower or differently-typed
+  target column, a `NOT NULL` target column with no default and no source. Loading
+  those rows anyway would produce a database that looks loaded and is wrong. The plan
+  is built before anything is written, so a refusal leaves the target untouched —
+  normally it means the container has the wrong version of an extension installed.
+  `--skip-mismatched` reports such a table and carries on with the rest; it never
+  loads one part way.
+- **`--replace` empties each table first.** Without it, a target table that already
+  has rows is refused rather than added to — a container's demo data plus a tenant's
+  data is neither database.
+- **`--dry-run`** prints the whole plan (matched tables, mapped column counts,
+  skips and their reasons) and writes nothing. Run it first.
+- **`$ndo$…` platform tables are left alone** unless you pass `--include-system`.
+  They describe the service tier's own view of the database — which apps are
+  installed, which tenant this is — and those answers belong to the container, not
+  to the export. Overwriting them breaks the container instead of filling it.
+- Rowversion columns are never written (SQL Server stamps its own), identity values
+  *are* preserved, and constraints are not checked during the load, so table order
+  does not matter.
+
+Values cross as the exact type the column declares: `decimal(38,20)` amounts go over
+as `SqlDecimal`, because `System.Decimal` silently rounds values BC actually stores.
+Rows are streamed and bulk-copied, so a table larger than memory costs no more than a
+small one; `--batch-size` sets the rows per batch.
+
+A `.bak` works as a source too (`bcdb restore BusinessCentral-W1.bak --to …`),
+which is the "copy this database into that container" case.
+
+> Note: `bcdb restore` is the only command that talks to a SQL Server. Everything
+> else in this tool still runs with no server anywhere.
 
 ### Serve mode — many reads over one open file
 
@@ -279,6 +342,9 @@ reports any disagreement).
   varbinary(max)/nvarchar(max)/varchar(max), including multi-page LOB trees and
   row-overflow columns.
 - Multi-company databases; AL names and types via `SymbolReference.json`.
+- Writing those rows into an existing SQL Server database with `bcdb restore`
+  (see above): tables and columns matched by name, every type above converted to
+  the column's own type, mismatches refused rather than loaded approximately.
 
 ## Not supported (fails loudly, by design)
 
@@ -297,6 +363,15 @@ reports any disagreement).
   refused, not just that column.
 - A `.bacpac` whose `Origin.xml` declares a Data stream version other than 2.0.0.0:
   the row framing was derived for 2.0.0.0 only, so the reader throws.
+- `bcdb restore` does not create anything: no database, no table, no index, no
+  schema. The target database and its tables must already exist — that is what
+  installing the extensions into the container does. It also does not read or write
+  a service tier's configuration, so an environment still has to be told about the
+  data the ordinary way.
+- On Linux the binary now needs ICU present (`libicu`), the way any other
+  non-invariant .NET application does. `Microsoft.Data.SqlClient`, which `restore`
+  uses, refuses to initialise under .NET's globalization-invariant mode, so the
+  build cannot enable it any more. Windows and macOS are unaffected.
 - In a `.bak`, varchar/char/text bytes ≥ 0x80 decode as Latin-1; a customer
   database with a different single-byte collation could map 0x80–0x9F differently.
   This does not apply to a `.bacpac`, where those columns are written as UTF-16.
@@ -313,6 +388,22 @@ absent; it never skips silently.
 `fixtures/typeprobe.bak`) everywhere, including CI. Tests that need the ~900 MB
 demo backups report as **skipped** when the files are absent — and CI asserts
 they were skipped, so a green run cannot mean "tested nothing".
+
+`bcdb restore` is verified the same way, in two tiers. What it decides (which
+tables and columns map, what it refuses) and how it converts every value is
+hermetic: the conversion tests take the type-probe backup's `probe_notnull` — every
+supported type as `NOT NULL`, at its extremes — convert each cell the way the load
+would, and compare the result against the `SELECT` output a real SQL Server
+produced for it. That the rows then *land* needs a server, so it is a skippable
+integration test: point `BCDB_RESTORE_SQL` at one and it writes into a scratch
+database and reads the rows back with SQL Server's own `SELECT`.
+
+```
+BCDB_RESTORE_SQL='Server=localhost,14330;User ID=sa;Password=…;TrustServerCertificate=True' \
+  dotnet test BcDb.sln -c Release
+```
+
+`./verify.sh` passes the oracle in and **fails** if those tests report as skipped.
 
 ## License
 

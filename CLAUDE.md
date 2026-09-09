@@ -7,6 +7,11 @@ page map from the allocation bitmaps, walks the system catalog, and decodes rows
 including page compression and off-page LOBs. For a `.bacpac` it reads the zip
 container, streams `model.xml` for the schema, and decodes native-BCP data
 streams. Both land in one query surface (`IBcSource`).
+
+One command goes the other way: `bcdb restore` writes a source's rows into a database
+that already exists (a BC container with its extensions installed), matching tables and
+columns by name and refusing anything it cannot carry across exactly. It is the only
+command that talks to a SQL Server, and the only one that writes anything.
 `README.md` has the user-facing scope; `PROVENANCE.md` records where every
 non-obvious structural fact came from and how it was validated.
 
@@ -26,7 +31,11 @@ non-obvious structural fact came from and how it was validated.
 | `src/BcDb.Core/Source.cs` | `IBcSource`: the tables/columns/rows contract both containers implement |
 | `src/BcDb.Core/Bacpac.cs` | the `.bacpac` zip container, Origin.xml guards, streaming model.xml |
 | `src/BcDb.Core/Bcp.cs` | native-BCP row framing: prefix widths, per-type storage-form conversion |
-| `src/BcDb.Cli/Program.cs` | the `bcdb` CLI (tables / read / describe / check / verify) |
+| `src/BcDb.Cli/Program.cs` | the `bcdb` CLI (tables / read / describe / check / verify / restore) |
+| `src/BcDb.Cli/RestorePlan.cs` | restore: target schema model, name matching, the refusals |
+| `src/BcDb.Cli/RestoreValues.cs` | restore: decoded value → the CLR type the column takes |
+| `src/BcDb.Cli/RestoreRowReader.cs` | restore: source rows as the IDataReader a bulk copy consumes |
+| `src/BcDb.Cli/SqlRestore.cs` | restore: catalog read, truncate, SqlBulkCopy, the CLI subcommand |
 | `tests/BcDb.Tests/` | hermetic unit + end-to-end tests (see rules on skips) |
 | `fixtures/` | oracle-exported expected values + the committed `typeprobe.bak` |
 | `tools/` | scripts that regenerate the probe databases and fixtures on the oracle |
@@ -47,6 +56,16 @@ For `.bacpac` work the oracle plays the same role through `sqlpackage`
 (`dotnet tool install -g microsoft.sqlpackage`; the container publishes SQL on host
 port **14330**): `/Action:Export` produces a bacpac from a probe database,
 `/Action:Import` loads any bacpac back for a `SELECT` comparison.
+
+For `restore` work it is the destination as well as the oracle: the round-trip tests take
+a connection string in `BCDB_RESTORE_SQL` and create/drop their own scratch database, and
+`verify.sh` passes it in and fails if they report as skipped.
+
+```bash
+PASS=$(docker exec bakreader-oracle printenv MSSQL_SA_PASSWORD)
+BCDB_RESTORE_SQL="Server=localhost,14330;User ID=sa;Password=$PASS;TrustServerCertificate=True" \
+  dotnet test BcDb.sln -c Release
+```
 
 ## Operating rules
 
@@ -83,6 +102,7 @@ dotnet test  BcDb.sln -c Release        # hermetic suite (typeprobe.bak + typepr
 ./verify.sh                              # full gate; needs the ~900 MB demo backups
 src/BcDb.Cli/bin/Release/net8.0/bcdb check <file.bak>   # page-map self-check on any backup
 src/BcDb.Cli/bin/Release/net8.0/bcdb serve <file>       # open once, JSON requests over stdin (the consumer path)
+src/BcDb.Cli/bin/Release/net8.0/bcdb restore <file> --to "<connection>" --dry-run   # the one writing command
 
 dotnet publish src/BcDb.Cli/BcDb.Cli.csproj -c Release -r linux-x64 -o out
 out/bcdb ...                            # the shipping build: self-contained, native
