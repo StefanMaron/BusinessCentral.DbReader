@@ -49,6 +49,12 @@ public sealed record TablePlan(
 
     /// <summary>The source's key columns, which become the created table's clustered primary key.</summary>
     public IReadOnlyList<string> KeyColumns { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Source columns the target lacks whose values were dropped rather than carried across,
+    /// under --allow-column-loss. Empty unless that option let this table load at all.
+    /// </summary>
+    public IReadOnlyList<string> DroppedColumns { get; init; } = Array.Empty<string>();
 }
 
 /// <summary>A source table that will not be written, and why — always reported, never silent.</summary>
@@ -61,20 +67,45 @@ public sealed record RestoreOptions
     public IReadOnlyCollection<string> OnlyTables { get; init; } = Array.Empty<string>();
 
     /// <summary>
+    /// Source company name → target company name. A source table whose name starts with
+    /// "&lt;SourceCompany&gt;$" (or is exactly that company) is matched and, when created,
+    /// named as if it belonged to the target company instead — the rows still come from
+    /// the real source table (<see cref="TablePlan.Source"/> is unaffected), only where
+    /// they land changes.
+    ///
+    /// For restoring into a company that already exists, correctly, with its own schema —
+    /// a Business Central container's own demo company (CRONUS, or one an admin created
+    /// through BC itself), rather than a company this restore has to build from nothing.
+    /// Reusing it sidesteps every gap between what a bare source schema declares and what
+    /// BC's own tooling actually needs — generated SumIndexField views, per-key indexes,
+    /// anything else that is a property of a *properly created* company, not of any one
+    /// table's declared columns — because that schema was never touched: the extensions
+    /// that own it already built it correctly.
+    ///
+    /// Tables with no company prefix at all (User, Company itself, the Tenant Profile and
+    /// NAV App families, $ndo$… platform tables) are unaffected: nothing about identity,
+    /// permissions, profile registration, or the platform's own app/company registry should
+    /// come from the source, which is exactly what <see cref="RestorePlanner.ContainerIdentityTables"/>
+    /// and $ndo$ tables are already excluded by default for — this option does not exclude
+    /// anything itself, it only decides the destination table name for tables that do carry
+    /// a company prefix.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> RenameCompany { get; init; } =
+        new Dictionary<string, string>();
+
+    /// <summary>
     /// These source tables (raw SQL object names) are left alone entirely — not created,
     /// not written, target rows untouched. Checked before every other rule, including
-    /// --table: it always wins, the same way $ndo$ tables always win over --table.
+    /// --table: it always wins, the same way $ndo$ and <see cref="RestorePlanner.ContainerIdentityTables"/>
+    /// tables always win over --table.
     ///
-    /// For restoring into a database that is already running, not a blank one: the
-    /// container's own login/session/company-identity tables — `User`, `Access Control`,
-    /// `User Personalization`, the platform's `$ndo$tenantcompany` registry — are not part
-    /// of the exported tenant's business data, they are how *this* server knows who can
-    /// sign in and what it currently considers the tenant's companies. Restoring them
-    /// replaces the container's own working identity with the source's, which is business
-    /// data for the source's server, not something a target server should adopt.
-    /// $ndo$-prefixed tables already default to excluded (<see cref="IncludeSystem"/>);
-    /// this is the same idea for ordinary-looking tables that also happen to be
-    /// container-local rather than business data.
+    /// The container's own login/session/company-identity/app-registry tables no longer
+    /// need naming here — <see cref="RestorePlanner.ContainerIdentityTables"/> excludes them
+    /// by default the same way $ndo$-prefixed tables already did
+    /// (<see cref="IncludeSystem"/>) — so this is for anything *else* a particular restore
+    /// should not touch: a table an extension owns that this target's version does not
+    /// carry the same way, company-scoped state a caller wants left alone for its own
+    /// reasons, and so on.
     /// </summary>
     public IReadOnlyCollection<string> ExcludeTables { get; init; } = Array.Empty<string>();
 
@@ -90,21 +121,61 @@ public sealed record RestoreOptions
     /// </summary>
     public bool IncludeSystem { get; init; }
 
+    /// <summary>
+    /// Write the container's own login, session, profile and installed-app tables too —
+    /// <see cref="RestorePlanner.ContainerIdentityTables"/> — instead of leaving them alone
+    /// by default. Off by default for the same reason $ndo$... tables are: these describe
+    /// the *container's* own state, not the exported tenant's business data, and restoring
+    /// into a database that is already running and signed into (the point of
+    /// <see cref="RenameCompany"/>) means overwriting them breaks the container rather than
+    /// filling it — a login locked out (User, Access Control, User Personalization, User
+    /// Property), a company registration that no longer matches what was just written
+    /// (Company), a profile a signed-in user can no longer resolve after the next service-
+    /// tier restart (the Tenant Profile family), or an installed-app registry pointing at
+    /// packages the container never compiled (the NAV App family) — every one of these was
+    /// observed breaking a real container this way before being added to the list.
+    /// </summary>
+    public bool IncludeIdentity { get; init; }
+
     /// <summary>Empty each target table before loading it. Without it a non-empty target is refused.</summary>
     public bool Replace { get; init; }
 
     /// <summary>
     /// Create what the target does not have: a table the source has and the target lacks,
-    /// and a column missing from a table that does exist. On by default.
+    /// and a column missing from a table that does exist. Off by default; --create turns it
+    /// on.
     ///
-    /// This is what makes the command useful against a Business Central container. BC
-    /// keeps a table's data when its extension is uninstalled and picks the table up again
-    /// when the extension is reinstalled, so a table that exists before its owner does is
-    /// a state BC already handles — and a column or a table it does not know about is
-    /// ignored rather than resented. Creating is therefore the permissive, useful default;
-    /// --no-create turns it off for a target whose schema must not be touched.
+    /// Building a table's own shape from a bare source schema cannot reproduce what BC's own
+    /// schema synchronisation generates when a table is created *through BC* — SumIndexField
+    /// views, per-key indexes, whatever else a properly installed extension's table has that
+    /// a `CREATE TABLE` matching its declared columns does not. Confirmed broken this way: a
+    /// company built by letting an earlier version of this default create its tables failed
+    /// with `Invalid object name '…$VSIFT$Key2'` the moment a page touched a FlowField.
+    /// Restoring into a container whose extensions are already installed avoids the problem
+    /// entirely — the table was never built by this tool, only filled — which is why that is
+    /// the default now: --create is for the caller who has decided an incomplete table (or
+    /// none of this tool's business, since the caller is not restoring into an existing BC
+    /// schema at all) is an acceptable tradeoff, not the assumption every restore starts from.
     /// </summary>
-    public bool CreateMissing { get; init; } = true;
+    public bool CreateMissing { get; init; }
+
+    /// <summary>
+    /// Drop a source column's values instead of refusing the whole table when the target
+    /// lacks that column (the default when --create is off — a target the source column has
+    /// no home in is nothing to lose values from, it just adds one). On by default;
+    /// --no-allow-column-loss turns it off.
+    ///
+    /// Losing a column silently would produce rows that look complete and are not, but
+    /// refusing the whole table is a strictly bigger loss for the same reason — a production
+    /// tenant's installed extensions are essentially never identical to a dev sandbox's, so
+    /// this is the common case, not the exception, and losing every row over one unmapped
+    /// field (a `…$ext` companion table, most often — see "Restoring into a container that is
+    /// running" in PROVENANCE.md for what that costs a page that reads the main table) is a
+    /// worse default than dropping the field. Every column it drops is still named in the
+    /// plan, same as every other decision here — never silent either way, only which loss is
+    /// the default.
+    /// </summary>
+    public bool AllowColumnLoss { get; init; } = true;
 
     /// <summary>
     /// Refuse the whole restore when any table cannot be reconciled, instead of reporting
@@ -150,6 +221,98 @@ public static class RestorePlanner
     /// <summary>Source tables whose SQL name starts with '$' are the platform's own — see <see cref="RestoreOptions.IncludeSystem"/>.</summary>
     public static bool IsSystemTable(string sqlName) => sqlName.StartsWith('$');
 
+    /// <summary>
+    /// The container's own login, session, profile and installed-app tables — not
+    /// $ndo$-prefixed, so <see cref="IsSystemTable"/> does not already catch them, but the
+    /// same idea: they describe *this* container, not the exported tenant's business data.
+    /// See <see cref="RestoreOptions.IncludeIdentity"/>.
+    ///
+    /// User / Access Control / User Personalization / User Property / Company: who can sign
+    /// in and which companies this server currently considers real — restoring them replaces
+    /// the container's own working identity with the source's.
+    ///
+    /// Tenant Profile / Tenant Profile Extension / Tenant Profile Page Metadata / Tenant
+    /// Profile Setting: a source bacpac carries these near-empty (a cloud export does not
+    /// include the platform's own role-center registration), so --replace truncates the
+    /// container's own correctly-populated rows down to the source's — confirmed by
+    /// reproducing "No default profile could be found" / role center stuck on "Getting
+    /// ready" on a real container, then confirming it does not reproduce once these are
+    /// left alone.
+    ///
+    /// NAV App Installed App / NAV App Published App / NAV App Setting / NAV App Tenant
+    /// Add-In / NAV App Tenant Operation / NAV App Data Archive: the container's own record
+    /// of which compiled app packages are installed. A source tenant's extension set is
+    /// essentially never identical to a dev container's, so restoring these points the
+    /// container at packages it never compiled — confirmed the same way: reproduced NST's
+    /// "Could not find any app metadata for 1 runtime package IDs" restoring them, confirmed
+    /// it does not reproduce leaving them alone.
+    /// </summary>
+    public static readonly IReadOnlyCollection<string> ContainerIdentityTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "User", "Access Control", "User Personalization", "User Property", "Company",
+        "Tenant Profile", "Tenant Profile Extension", "Tenant Profile Page Metadata", "Tenant Profile Setting",
+        "NAV App Installed App", "NAV App Published App", "NAV App Setting",
+        "NAV App Tenant Add-In", "NAV App Tenant Operation", "NAV App Data Archive",
+    };
+
+    /// <summary>See <see cref="ContainerIdentityTables"/>.</summary>
+    public static bool IsContainerIdentityTable(string sqlName) => ContainerIdentityTables.Contains(sqlName);
+
+    /// <summary>
+    /// The company segment of a raw SQL table name, or null when the name carries none —
+    /// $ndo$... platform tables, container-identity tables, and a handful of genuinely
+    /// company-agnostic AL tables all have no prefix. Mirrors the shape
+    /// Program.BcTables derives company/table/app-id names from
+    /// (<code>&lt;Company&gt;$&lt;Table&gt;[$&lt;AppId&gt;][$ext]</code>) — kept here as its own
+    /// small function rather than called across into the CLI dispatcher, since this is the
+    /// one piece of it a restore's own company auto-detection needs.
+    /// </summary>
+    public static string? CompanySegment(string sqlTableName)
+    {
+        var segs = sqlTableName.Split('$');
+        bool isExt = segs[^1] == "ext";
+        var core = isExt ? segs[..^1] : segs;
+        if (core.Length >= 3 && Guid.TryParse(core[^1], out _)) return string.Join("$", core[..^2]);
+        if (core.Length == 2 && Guid.TryParse(core[^1], out _)) return null;   // <table>$<appid>, no company
+        if (core.Length == 2) return core[0];                                  // <company>$<table>
+        return null;
+    }
+
+    /// <summary>
+    /// The source's own companies that actually carry data — grouped by
+    /// <see cref="CompanySegment"/>, keeping only a company with at least one row somewhere
+    /// under it. A cloud export commonly carries an unused "My Company" skeleton alongside
+    /// the real one (every table 0 rows); filtering it out is what makes single-company
+    /// auto-detection actually single in that case rather than perpetually ambiguous.
+    ///
+    /// <paramref name="inScope"/> narrows which source tables are even looked at — a
+    /// company entirely outside --table/--exclude-table's scope should not force a company
+    /// choice on a restore that was never going to touch it. Every table counts when omitted.
+    /// </summary>
+    public static IReadOnlyList<string> SourceCompaniesWithData(IBcSource source, Func<string, bool>? inScope = null)
+        => source.Tables
+            .Where(t => inScope is null || inScope(t.Name))
+            .Select(t => (Table: t, Company: CompanySegment(t.Name)))
+            .Where(x => x.Company != null)
+            .GroupBy(x => x.Company!, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Any(x => x.Table.RowCount() > 0))
+            .Select(g => g.Key)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+
+    /// <summary>
+    /// The distinct companies the target's *own* schema already declares — read off its
+    /// table names, the ground truth for what a company's SQL prefix actually is (BC
+    /// replaces characters SQL disallows in an identifier with '_', so the display name in
+    /// the target's own Company table is not reliably the same string). No data filter: a
+    /// company existing in the target's schema at all is the question, not how much it holds.
+    /// </summary>
+    public static IReadOnlyList<string> TargetCompanies(IReadOnlyList<TargetTable> target)
+        => target.Select(t => CompanySegment(t.Name)).Where(c => c != null).Select(c => c!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+
     public static (IReadOnlyList<TablePlan> Tables, IReadOnlyList<SkippedTable> Skipped) Build(
         IBcSource source, IReadOnlyList<TargetTable> target, RestoreOptions opts)
     {
@@ -183,19 +346,28 @@ public static class RestorePlanner
                     + "the container — pass --include-system to write it anyway"));
                 continue;
             }
-            byName.TryGetValue(st.Name, out var hits);
+            if (!opts.IncludeIdentity && IsContainerIdentityTable(st.Name))
+            {
+                skipped.Add(new SkippedTable(st.Name,
+                    "the container's own login, session, profile or installed-app state, not the exported "
+                    + "tenant's business data — pass --include-identity to write it anyway"));
+                continue;
+            }
+            string targetName = RenameCompanyPrefix(st.Name, opts.RenameCompany) ?? st.Name;
+            byName.TryGetValue(targetName, out var hits);
             if (hits is null && !opts.CreateMissing)
             {
                 skipped.Add(new SkippedTable(st.Name,
-                    "no table of this name in the target database, and --no-create was given"));
+                    $"no table named {targetName} in the target database — pass --create to build it "
+                    + "from the source's own schema"));
                 continue;
             }
             if (hits is { Count: > 1 })
                 throw new InvalidDataException(
-                    $"the target database has {hits.Count} tables named {st.Name} "
+                    $"the target database has {hits.Count} tables named {targetName} "
                     + $"(schemas {string.Join(", ", hits.Select(h => h.Schema).OrderBy(x => x, StringComparer.Ordinal))}) "
                     + "— refusing to guess which one the source's rows belong in");
-            try { plans.Add(BuildTable(source, st, hits?[0], opts)); }
+            try { plans.Add(BuildTable(source, st, targetName, hits?[0], opts)); }
             catch (InvalidDataException) when (opts.Strict) { throw; }
             catch (InvalidDataException ex)
             {
@@ -206,18 +378,38 @@ public static class RestorePlanner
     }
 
     /// <summary>
-    /// The plan for one table. <paramref name="existing"/> is null when the target has no
-    /// such table and it is to be created.
+    /// Source table name → target table name under a <see cref="RestoreOptions.RenameCompany"/>
+    /// mapping, or null when no company prefix in it matches (including when the table
+    /// carries no company prefix at all). A match is a whole leading "&lt;Company&gt;$"
+    /// segment — never a bare string prefix, so a mapped company "TP" does not also catch
+    /// a table actually belonging to company "TPX".
     /// </summary>
-    static TablePlan BuildTable(IBcSource source, SourceTable st, TargetTable? existing, RestoreOptions opts)
+    public static string? RenameCompanyPrefix(string sourceTableName, IReadOnlyDictionary<string, string> renameCompany)
+    {
+        foreach (var (src, dst) in renameCompany.OrderByDescending(kv => kv.Key.Length))
+        {
+            if (sourceTableName.Equals(src, StringComparison.OrdinalIgnoreCase)) return dst;
+            if (sourceTableName.StartsWith(src + "$", StringComparison.OrdinalIgnoreCase))
+                return dst + sourceTableName[src.Length..];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The plan for one table. <paramref name="existing"/> is null when the target has no
+    /// such table and it is to be created; <paramref name="targetName"/> is the source
+    /// table's own name, or its <see cref="RenameCompanyPrefix"/> substitution.
+    /// </summary>
+    static TablePlan BuildTable(IBcSource source, SourceTable st, string targetName, TargetTable? existing, RestoreOptions opts)
     {
         var srcCols = source.Columns(st);
         var keyColumns = source.RowKeyColumns(st);
         bool create = existing is null;
-        var tt = existing ?? new TargetTable("dbo", st.Name, Array.Empty<TargetColumn>());
+        var tt = existing ?? new TargetTable("dbo", targetName, Array.Empty<TargetColumn>());
 
         var mappings = new List<ColumnMapping>();
         var addColumns = new List<SysColumn>();
+        var droppedColumns = new List<string>();
         var columns = tt.Columns.ToList();
         var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -231,10 +423,16 @@ public static class RestorePlanner
             var hit = columns.FirstOrDefault(c => c.Name.Equals(sc.Name, StringComparison.OrdinalIgnoreCase));
             if (hit is null)
             {
+                if (!opts.CreateMissing && opts.AllowColumnLoss)
+                {
+                    droppedColumns.Add(sc.Name);
+                    continue;
+                }
                 if (!opts.CreateMissing)
                     throw new InvalidDataException(
                         $"{st.Name}.{sc.Name} ({TypeText(sc)}) has no column in target table {tt.QuotedName}, "
-                        + "and --no-create was given — refusing to load rows that would silently lose it");
+                        + "and --no-allow-column-loss was given — refusing to load rows that would lose it "
+                        + "(pass --create to add the column instead)");
                 hit = Synthesize(sc, columns.Count + 1);
                 columns.Add(hit);
                 if (!create) addColumns.Add(sc);
@@ -271,6 +469,7 @@ public static class RestorePlanner
             AddColumns = addColumns,
             SourceColumns = srcCols,
             KeyColumns = keyColumns,
+            DroppedColumns = droppedColumns,
         };
     }
 

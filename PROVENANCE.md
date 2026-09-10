@@ -854,13 +854,6 @@ table it creates is one BC will accept.
 
 ## Restoring into a container that is running
 
-- **The service tier caches records, and a restore under a live NST is visible to it.**
-  Observed: a row edited directly in SQL was served by the API immediately (so the NST does
-  read through), but after `bcdb restore --replace` rewrote the table, every subsequent API
-  request failed with *"The field 'Name' on table 'Customer' has changed in the database
-  between initial and JIT load"* — BC's partial-record consistency check comparing its
-  cached initial load against a just-in-time reload. It did not clear on retry. **Restart
-  the service tier after a restore**; the data itself was correct in SQL throughout.
 - The rows landed exactly: all 5 rows and 106 columns of the demo Customer table were
   written from a `BACKUP DATABASE` of the container's own CRONUS and read back identical,
   with a deliberately tampered value overwritten by the original.
@@ -890,7 +883,10 @@ table it creates is one BC will accept.
     *not* independent identity, though: it needs to track `Company`'s actual content, and
     left alone across a restore that changed which companies exist, it defaults the web
     client at a company name (observed: the pre-restore demo company) that no longer has a
-    row in `Company` — *"The Company does not exist."*
+    row in `Company` — *"The Company does not exist."* Restoring *into* an existing,
+    already-correctly-registered company (`--rename-company`, below) sidesteps this
+    entirely: `$ndo$tenantcompany` never needs touching because which companies exist never
+    changes.
   - On a **fresh, never-restored** container, all of `User`, `Access Control`,
     `User Personalization`, `Profile` and `Tenant Profile` start empty and get seeded
     lazily on first real sign-in (confirmed by driving an actual login with Playwright and
@@ -898,15 +894,103 @@ table it creates is one BC will accept.
     naive ~20 s check. That self-heal does not run again once rows already exist for a
     SID, even blank ones, which is why a restored container's *stale* rows fail loudly
     instead of being quietly reseeded.
-  - **`--exclude-table`** (added for exactly this) leaves named tables completely
-    untouched — not created, not written, target rows left as they were — so the
-    container's own `User`/`Access Control`/`User Personalization` survive a
-    `--replace` restore intact. `$ndo$tenantcompany` does *not* belong in that list (it
-    needs reconciling to the restored `Company` rows, not preserving); with the other
-    three excluded and `$ndo$tenantcompany`'s two stale names hand-updated to the two
-    restored company names, the same production `.bacpac` came up in the real web client
-    end to end — full role center, real nav (including a third-party Shopify extension
-    entry), real restored customer data — with zero further manual intervention.
+
+### Restoring into an already-correct, existing company (`--rename-company`)
+
+A developer wants real production data to write tests against, in a container whose
+extensions are already installed and whose company (CRONUS, or one BC's own tooling
+created) already has correct schema — generated SumIndexField views, per-key indexes,
+everything a table's declared columns alone do not capture. `--rename-company` maps a
+source company's table prefix onto that existing company's, so nothing about its schema
+is ever touched; only where rows land changes. This turned out to need excluding far more
+than the three identity tables above, discovered by getting the same production `.bacpac`
+working end to end against a real `MsDyn365Bc.On.Linux` container (BC 28.4), the same way:
+reproduce a failure, trace it to one specific table the restore had overwritten, exclude
+it, confirm the failure is gone on a from-scratch container, repeat.
+
+- **The `NAV App …` family is the container's own installed-app registry, and restoring it
+  breaks app/profile resolution on the *next* service-tier restart — not immediately.**
+  `NAV App Installed App` and `NAV App Published App` (and, less consequentially,
+  `NAV App Setting`, `NAV App Tenant Add-In`, `NAV App Tenant Operation`,
+  `NAV App Data Archive`) are present in a cloud export with the *source tenant's own*
+  installed-app set, essentially never identical to a dev container's. Restoring them
+  (`--replace` truncates `NAV App Published App` to the source's near-always-empty count)
+  leaves the currently-running NST unaffected — it already has the real registry loaded in
+  memory — but the *next* NST process to start reads the now-wrong table and logs
+  `Could not find any app metadata for 1 runtime package IDs` /
+  `Did not get any metadata for runtime package IDs 00000000-0000-0000-0000-000000000000`,
+  and any user whose `User Personalization` names a profile it can no longer resolve gets
+  `No default profile could be found` → `InvalidHomepageException` → the same unending
+  "Getting ready…" spinner as the identity-table failures above, from a completely
+  different cause. Isolated by controlled A/B testing on one container across many restart
+  cycles: repeated restarts of a database that had *never* had these tables restored over
+  it (3 in a row, one right after another) left login working every time; the first restart
+  after restoring them over it broke login every time, on the same container, same restart
+  mechanism — confirmed by then leaving only these tables un-excluded (everything else
+  correct) and reproducing the break in isolation, then confirming it stops reproducing
+  once they are excluded.
+  - A related, initially misleading finding: killing the NST process directly
+    (`docker exec … kill <pid>`) takes the *whole container* down (exit 143) rather than
+    restarting NST alone — this image's entrypoint just `wait`s on that one pid with no
+    supervisor loop around it. That is a `bc-linux` packaging fact, not a `bcdb` one, but
+    it is why every reproduction here used a real `docker compose restart`/recreate rather
+    than a targeted process signal — there was no other way to bounce just the service tier
+    until that image gained one.
+- **`Tenant Profile` (and its `Tenant Profile Extension`/`Page Metadata`/`Setting`
+  siblings) is the platform's own profile/role-center registration for a company, and a
+  cloud export carries it near-empty** (a bacpac does not include the platform's own
+  role-center registration) — `--replace` truncates the container's own correctly
+  populated rows down to the source's. Confirmed as a real, independent cause using the
+  same isolation technique as the `NAV App` family above: excluding it stops one specific
+  reproduction of the "Getting ready" spinner, on a container where the `NAV App` family
+  was already excluded and could not have been the cause.
+  - `Profile`/`Profile Metadata` (no company or `Tenant` prefix) were checked too and
+    found **not** to be the mechanism: they read `0` rows on a container with a fully
+    working login, and a cloud export does not carry them at all (`bcdb tables` on the
+    52 MB production export shows no matching table), so excluding them is a no-op either
+    way — left out of the default list for that reason, not restored into by accident.
+- **An extension's table companion (`…$ext`) needs its own matching rows, or the base
+  table's own List page can render as if the table were empty** — full data underneath,
+  zero errors anywhere, zero rows shown. Found by a direct A/B comparison on a real
+  container: a customer inserted through the web client (going through AL, which creates
+  the `$ext` companion row as part of the insert) rendered in the classic Customer List
+  immediately; the 15 customers a correct restore had just placed in the *same* table,
+  through the *same* session, did not — until `Customer$ext` was manually given matching
+  rows for those 15 customers (borrowing the `No.` of each), at which point they rendered
+  too. (Two more things were checked and ruled out first, since they are the more obvious
+  suspects: raw SQL confirms the rows and their SQL indexes are fine — a seek by primary
+  key finds the row a query plan-cache rebuild does not change; and BC's own OData/API
+  surface and an "Analysis" pivot-mode view of the same List page both read the same 15
+  rows correctly throughout — it is specifically the classic List page's own row-fetch
+  path that needs `$ext` populated, not the underlying table or company.) The reason
+  `Customer$ext` had no rows for them: `--no-create`'s usual refusal — the source's
+  `$ext` carries columns from extensions the target container never installed (a
+  production tenant's Clockify/Avalara/Stripe integrations, say) that the target's own
+  `$ext` table does not have, so the whole table was reported and skipped rather than
+  losing those columns' values silently. `--allow-column-loss` (below) is the fix: drop
+  just those columns, keep the row.
+- **`--exclude-table` no longer has to name any of this by hand.** Every table above is
+  now `RestorePlanner.ContainerIdentityTables` — the same always-wins-over-`--table`
+  default `$ndo$…` tables already got, opted back into with `--include-identity` — so the
+  minimal restore of the time was `--replace --no-create --allow-column-loss --rename-company
+  "Src=Dst"` with no `--exclude-table` at all. Confirmed to produce the identical plan (same
+  table and row counts) as the hand-written 15-table `--exclude-table` list that preceded it.
+  All four of those flags were subsequently made the default (below): `--replace`'s effect
+  now applies unless `--no-replace` is given, `--no-create`'s and `--allow-column-loss`'s
+  effects no longer need naming at all, and `--rename-company` became optional, auto-detected
+  in the common one-company-each-side case.
+- **A service-tier restart turned out not to be required at all, once the restore is
+  actually correct.** The "restart afterwards" advice below predates this section and was
+  never wrong on its own terms — a row edited directly in SQL is served immediately (the
+  NST does read through), but after an *earlier, wrong* restore had already left a page
+  cached as empty or had left NST mid-`InvalidHomepageException`, only a restart cleared
+  it. Once `NAV App …`, `Tenant Profile` and `Customer$ext` were all correctly handled, the
+  identical end-to-end sequence — log in once, restore, open the Customer List for the
+  *first* time in that session — rendered all 15 real customers with real transaction
+  counts on the first look, no restart anywhere in the sequence. The lesson generalizes:
+  the earlier "stale cache" symptom was a symptom of restoring *wrongly* under a session
+  that had already looked at the table, not an inherent property of restoring under a live
+  NST.
 
 ## Writing rows back: `bcdb restore` (`RestorePlan.cs`, `RestoreValues.cs`, `SqlRestore.cs`)
 
@@ -940,6 +1024,25 @@ takes. What follows is therefore mostly *decisions and their evidence*, not stru
   it. Writing a cloud tenant's answers over them breaks the container rather than filling
   it with data. `--include-system` opts in; the exclusion is reported per table, never
   silent. (`$probe$platform` in the type-probe database exercises the rule.)
+- **`RestorePlanner.ContainerIdentityTables` are excluded by default the same way**, for
+  ordinary-looking (not `$`-prefixed) tables that are just as container-local: `User`,
+  `Access Control`, `User Personalization`, `User Property`, `Company`, the `Tenant
+  Profile` family and the `NAV App` family — see "Restoring into a container that is
+  running" for what each one breaks and how that was confirmed. `--include-identity` opts
+  in; both this and `--include-system` always win over `--table`, the same precedence.
+- **`--allow-column-loss` is on by default**, dropping a source column's values instead of
+  refusing the whole table when the target lacks that column (it only matters while
+  `--create` is off, since a target that gets the missing column added has nothing to
+  lose). A silent column loss producing rows that look complete and are not is exactly the
+  failure `loud-failures.md` warns against, but every dropped column is named in the plan —
+  loud, just not fatal — and for restoring into an existing container's schema, a
+  production tenant's installed extensions are essentially never identical to a dev
+  sandbox's, so the realistic alternative to dropping one field is losing the whole table,
+  `…$ext` companions included (see the Customer List finding above). That finding is also
+  why this became the default rather than staying opt-in: the failure it was found through
+  — Customer rows present but the classic List page rendering empty — has no error anywhere
+  to point at it, so a flag nobody knew to pass produced a silently-broken restore that
+  looked like it had worked. `--no-allow-column-loss` opts into the stricter refusal.
 - **decimal crosses as `SqlDecimal`, fixed at the target's declared precision and scale.**
   BC declares amounts `decimal(38,20)`, and `System.Decimal` holds 28-29 significant
   digits: the probe database's own `99999999999999999.99999999999999999999` has 37.
@@ -958,13 +1061,19 @@ takes. What follows is therefore mostly *decisions and their evidence*, not stru
   fixture's own `SELECT`, compared against the same fixture. It needs a server, so it is
   a `SkippableFact` gated on `BCDB_RESTORE_SQL`, and `verify.sh` both passes the oracle in
   and fails if the tests report as skipped there.
-- **What the target lacks is created, not refused.** A table the target does not have is
-  created from the source's own schema; a column missing from a table that does exist is
-  added. That is the useful default because BC tolerates a database holding more than its
-  extensions declare — a table or column nothing owns is ignored — and because a table that
-  already exists when its extension is installed is adopted rather than rejected, which is
-  the same path an uninstall/reinstall takes to keep a table's data across the gap.
-  `--no-create` turns it off for a target whose schema must not be touched.
+- **What the target lacks is left alone and reported, not created, by default —
+  `--create` opts in.** This flipped from create-by-default after real evidence that
+  building a table from the source's own bare schema is not a substitute for BC's own
+  schema synchronisation: restoring `Customer` into a target with no `Customer` table
+  (`--create` on) produced a table whose classic List page threw `Invalid object name
+  '…$VSIFT$Key2'` the first time a totals column needed the SumIndexField view BC's own
+  schema sync would have generated alongside the table. A generic `CREATE TABLE` cannot
+  reproduce that — it is not a property of the declared columns, only of a table having
+  been created *through BC* (the extension's own install, or its own uninstall/reinstall
+  adoption path). Since the common target is a container whose extensions already built
+  the schema correctly, refusing to build one from scratch and reporting it instead is
+  the safer default; `--create` remains for a target that was never meant to have a real
+  BC schema, mainly a scratch database in a test.
 - **What is still refused is a value arriving as a different value.** A target column
   narrower than the source's, a different type, a different decimal scale or lower
   precision, a `NOT NULL` target column with no default and no source column: each names
@@ -973,10 +1082,33 @@ takes. What follows is therefore mostly *decisions and their evidence*, not stru
   column is skipped because it derives its own value. Such a table is reported and skipped
   by default — the plan is built before any write, so nothing from it lands either way, and
   the other 4,000 tables still load; `--strict` makes it stop the whole run instead.
-- **A non-empty target table is refused without `--replace`.** Adding a tenant's rows to a
-  container's demo data gives a database that is neither. With `--replace` each table is
-  emptied first: `TRUNCATE`, falling back to `DELETE` (reported, not silent) where a
-  foreign key refers to the table.
+- **A non-empty target table is refused without replacing.** Adding a tenant's rows to a
+  container's demo data gives a database that is neither. Replacing empties each table
+  first: `TRUNCATE`, falling back to `DELETE` (reported, not silent) where a foreign key
+  refers to the table. Replacing is the default *effect* but not an assumed one: with
+  neither `--replace` nor `--no-replace` given, an interactive terminal
+  (`Console.IsInputRedirected || Console.IsOutputRedirected` both false) is asked before
+  anything is written, and a non-interactive one is refused — a destructive default that
+  silently ran unattended in a script is worse than one that is merely opt-out. `--dry-run`
+  skips the prompt entirely, since nothing is written either way.
+- **Company mapping is auto-detected when unambiguous, instead of `--rename-company`
+  being mandatory.** `RestorePlanner.SourceCompaniesWithData` groups the source's own
+  table names by company segment (parsing the same `<Company>$<Table>[$<AppId>][$ext]`
+  shape `RestorePlanner.CompanySegment` derives, never guessing an AL-to-SQL name
+  transformation) and keeps only a company with at least one row somewhere in scope;
+  `RestorePlanner.TargetCompanies` reads company segments off the target's own live
+  schema the same way. When each list has exactly one entry, `SqlRestore.ResolveCompany`
+  maps it to the other and logs the mapping (`company Fabrikam Inc. -> CRONUS
+  International Ltd_ (auto-detected: the only company with data on each side)`) so it is
+  never a silent guess. With more than one company on either side it throws, naming every
+  company found on both sides, rather than picking one — this is the case
+  [PR #21's discussion](https://github.com/StefanMaron/BusinessCentral.DbReader/pull/21)
+  raised: a cloud tenant's export and a CRONUS container almost never share a company
+  name, so this had to work without the caller supplying `--rename-company` by hand for
+  the ordinary one-company-each-side case, while still refusing rather than guessing once
+  either side has more than one. A target with no company-prefixed tables at all (the
+  hermetic tests' own scratch-database shape) is left with no rename applied, regardless
+  of the source — there is nothing to map into.
 
 ### Consequences for the shipped binary, measured
 

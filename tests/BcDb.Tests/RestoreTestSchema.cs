@@ -70,4 +70,62 @@ public static class RestoreTestSchema
     /// <summary>Replace one table of a mirrored target database.</summary>
     public static List<TargetTable> Replace(this List<TargetTable> db, TargetTable t)
         => db.Select(x => x.Name == t.Name ? t : x).ToList();
+
+    /// <summary>
+    /// The wrapped source's own tables, plus one more per <paramref name="aliases"/>: a
+    /// <see cref="SourceTable"/> under a new name whose columns and rows are exactly
+    /// <paramref name="borrowFrom"/>'s. Column/row lookup keys off the borrowed table's own
+    /// handle, never its name, so the alias reads as a real, independent table — this is
+    /// how a check against real BC table names (RestorePlanner's container-identity list,
+    /// which the committed typeprobe.bak has no matching names for and must not be hand-
+    /// edited to add — oracle-verification.md) gets exercised against a name it actually
+    /// recognizes, without needing that name in the fixture itself.
+    /// </summary>
+    public static IBcSource WithAliases(this IBcSource src, string borrowFrom, params string[] aliases)
+        => new AliasedSource(src, borrowFrom, aliases);
+
+    /// <summary>
+    /// The wrapped source's own tables, plus one raw <see cref="SourceTable"/> per
+    /// <paramref name="extras"/> — a name and a row count, nothing borrowed. For a check
+    /// that only ever calls <c>.Name</c>/<c>.RowCount()</c> (company auto-detection's
+    /// data-filter, in particular), which is everything a fake handle that is never
+    /// dereferenced needs to get right.
+    /// </summary>
+    public static IBcSource WithExtraTables(this IBcSource src, params (string Name, long RowCount)[] extras)
+        => new ExtraTablesSource(src, extras);
+
+    sealed class AliasedSource(IBcSource inner, string borrowFrom, string[] aliases) : IBcSource
+    {
+        readonly SourceTable _borrowed = inner.Tables.Single(t => t.Name == borrowFrom);
+        List<SourceTable>? _tables;
+
+        public IReadOnlyList<SourceTable> Tables => _tables ??= inner.Tables
+            .Concat(aliases.Select(a => new SourceTable(a, _borrowed.Compression, _borrowed.RowCountProvider, _borrowed.Handle)))
+            .ToList();
+
+        public IReadOnlyList<SysColumn> Columns(SourceTable t) => inner.Columns(t);
+        public IReadOnlyList<string> RowKeyColumns(SourceTable t) => inner.RowKeyColumns(t);
+        public IEnumerable<IReadOnlyDictionary<string, object?>> ReadRows(SourceTable t, IReadOnlyList<SysColumn> columns)
+            => inner.ReadRows(t, columns);
+        public void PreloadMetadata() => inner.PreloadMetadata();
+        public string Banner => inner.Banner;
+        public void Dispose() { } // the wrapped source is disposed by whoever opened it
+    }
+
+    sealed class ExtraTablesSource(IBcSource inner, (string Name, long RowCount)[] extras) : IBcSource
+    {
+        List<SourceTable>? _tables;
+
+        public IReadOnlyList<SourceTable> Tables => _tables ??= inner.Tables
+            .Concat(extras.Select(e => new SourceTable(e.Name, "none", () => e.RowCount, new object())))
+            .ToList();
+
+        public IReadOnlyList<SysColumn> Columns(SourceTable t) => inner.Columns(t);
+        public IReadOnlyList<string> RowKeyColumns(SourceTable t) => inner.RowKeyColumns(t);
+        public IEnumerable<IReadOnlyDictionary<string, object?>> ReadRows(SourceTable t, IReadOnlyList<SysColumn> columns)
+            => inner.ReadRows(t, columns);
+        public void PreloadMetadata() => inner.PreloadMetadata();
+        public string Banner => inner.Banner;
+        public void Dispose() { }
+    }
 }

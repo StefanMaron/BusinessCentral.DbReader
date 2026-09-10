@@ -195,7 +195,7 @@ tier, no `sqlpackage` import:
 ```
 # 1. start a container and install the extensions the data came from, as usual
 # 2. push the data in
-bcdb restore MyEnvironment.bacpac --replace \
+bcdb restore MyEnvironment.bacpac \
     --to "Server=localhost;Database=CRONUS;User ID=sa;Password=…;TrustServerCertificate=True"
 ```
 
@@ -204,37 +204,58 @@ the tables; this only carries rows into them, matching source table to target ta
 by SQL name, and column to column by name. That division is what makes it work with
 AppSource apps: whatever the container's apps declare is what the data lands in.
 
-What it does, and refuses to do:
+The defaults assume the common case — a container whose extensions already built the
+target's schema correctly, and a source whose one company should land in the target's
+one company — so the two-argument command above is usually the whole thing. What it
+does, and refuses to do:
 
-- **A table or column the target does not have is created**, from the source's own
-  schema — types, widths, scales and nullability, plus the source's key as a
-  clustered primary key named `<table>$Key1`, which is the shape BC's own schema
-  synchronisation produces. This is the useful default: BC ignores a table or column
-  none of its extensions declares, and *adopts* a table that already exists when its
-  extension is installed — the same path an uninstall/reinstall takes to keep a
-  table's data across the gap. `--no-create` turns it off and reports instead.
-- **What is still refused is a value that would arrive as a different value**: a
-  target column narrower than the source's, a different type, a different decimal
-  scale. Those tables are reported and skipped — the plan is built before anything is
-  written, so nothing from them lands — and `--strict` makes them stop the whole run
-  instead.
-- **`--replace` empties each table first.** Without it, a target table that already
-  has rows is refused rather than added to — a container's demo data plus a tenant's
-  data is neither database.
+- **A table or column the target does not have is left alone and reported, not
+  created.** Building one from the source's own bare schema cannot reproduce what
+  BC's own schema sync generates when a table is created through BC itself — in
+  particular the SumIndexField (VSIFT) indexed views a List page's totals depend on;
+  a table built by a generic `CREATE TABLE` throws `Invalid object name
+  '…$VSIFT$Key2'` the first time a page needs one. `--create` opts into building it
+  anyway, for a target that was never meant to have a real BC schema (a scratch
+  database in a test, mainly).
+- **`--allow-column-loss` is on by default**: a source column the target table lacks
+  has its values dropped instead of the whole table being refused — for a source
+  whose installed extensions don't quite match the target's own (a production tenant
+  rarely matches a dev sandbox's extension set exactly, and an extension's own
+  `…$ext` companion table needs its own rows or a base table's List page can render
+  as if the table were empty even though the data is all there — see PROVENANCE.md).
+  Every dropped column is still named in the plan. `--no-allow-column-loss` turns
+  this off and refuses those tables instead; it only matters while `--create` is off,
+  since a target getting the missing column added has nothing to lose.
+- **What is still refused regardless** is a value that would arrive as a different
+  value: a target column narrower than the source's, a different type, a different
+  decimal scale. Those tables are reported and skipped — the plan is built before
+  anything is written, so nothing from them lands — and `--strict` makes them stop
+  the whole run instead.
+- **Replacing existing rows is the default effect, but is confirmed rather than
+  assumed.** With neither `--replace` nor `--no-replace` given, an interactive
+  terminal is asked before anything is written; a non-interactive one (a script, CI)
+  is refused rather than guessed at — pass `--replace` or `--no-replace` explicitly
+  there. Without replacing, a target table that already has rows is refused rather
+  than added to — a container's demo data plus a tenant's data is neither database.
 - **`--dry-run`** prints the whole plan (matched tables, mapped column counts,
-  skips and their reasons) and writes nothing. Run it first.
+  skips and their reasons) and writes nothing, skipping the replace prompt since
+  nothing would be written either way. Run it first.
 - **`$ndo$…` platform tables are left alone** unless you pass `--include-system`.
   They describe the service tier's own view of the database — which apps are
   installed, which tenant this is — and those answers belong to the container, not
   to the export. Overwriting them breaks the container instead of filling it.
-- **`--exclude-table "A,B"` leaves specific tables completely untouched** — not
-  created, not written, target rows left exactly as they were. For restoring into a
-  container that is already running and signed into, not a blank one: the
-  container's own login/session tables (`User`, `Access Control`,
-  `User Personalization`) are ordinary tables as far as the restore is concerned, so
-  a plain `--replace` restore correctly overwrites them with the source tenant's own
-  users — which then locks the container's own admin login out of the web client.
-  Excluding those three keeps the local login working; it wins over `--table`.
+- **The container's own login/session/profile/installed-app tables are left alone by
+  default, the same way `$ndo$…` tables are.** `User`, `Access Control`,
+  `User Personalization`, `User Property`, `Company`, the `Tenant Profile` family and
+  the `NAV App` family are ordinary tables as far as the restore is concerned, so a
+  plain replace would otherwise overwrite them with the source tenant's own —
+  locking the container's own admin login out of the web client, or breaking
+  role-center/profile resolution the next time the service tier restarts (see
+  PROVENANCE.md for how each of those was found and confirmed). `--include-identity`
+  opts back in; it wins over `--table`, same as `--include-system`.
+- **`--exclude-table "A,B"` leaves any other specific tables completely untouched** —
+  not created, not written, target rows left exactly as they were. It wins over
+  `--table` too.
 - Rowversion columns are never written (SQL Server stamps its own), identity values
   *are* preserved, and constraints are not checked during the load, so table order
   does not matter.
@@ -247,18 +268,77 @@ small one; `--batch-size` sets the rows per batch.
 A `.bak` works as a source too (`bcdb restore BusinessCentral-W1.bak --to …`),
 which is the "copy this database into that container" case.
 
+### Restoring into an existing company, instead of creating one
+
+`bcdb restore` is mainly a developer tool: the point is real data to write tests
+against, in a container you already have running with its extensions installed. A
+new company built from the source's bare schema is not what you usually want — you
+want the container's own already-correct company (CRONUS, or one BC's own tooling
+created), with its generated SumIndexField views, per-key indexes and everything
+else that is a property of a properly created company, not of any table's declared
+columns. This is the default (above), so the common shape of this case — a cloud
+tenant's one company loaded into a container's one, differently-named company — is
+just:
+
+```
+bcdb restore MyEnvironment.bacpac \
+    --to "Server=localhost;Database=CRONUS;User ID=sa;Password=…;TrustServerCertificate=True"
+```
+
+**Company mapping is automatic when it is unambiguous.** `bcdb restore` looks at
+which companies actually have rows on the source side and which company-prefixed
+tables the target actually has, and when there is exactly one of each it maps that
+one to that one — logging `company Fabrikam Inc. -> CRONUS International Ltd_
+(auto-detected: the only company with data on each side)` so the mapping is never a
+surprise. This is the SaaS-tenant-into-a-differently-named-Cronus-company case:
+`--rename-company` is not needed to make it work.
+
+When either side has more than one company, the restore refuses rather than
+guesses, naming exactly what it found:
+
+```
+error: the source has 2 companies with data (My Company, Stefan Maron Consulting)
+and the target has 2 (CRONUS International Ltd_, My Company) — pass
+--rename-company "Src=Dst" to say which maps to which
+```
+
+```
+bcdb restore MyEnvironment.bacpac --rename-company "Fabrikam Inc.=CRONUS International Ltd_" \
+    --to "Server=localhost;Database=CRONUS;User ID=sa;Password=…;TrustServerCertificate=True"
+```
+
+`--rename-company` maps a source company's table prefix onto the target's — rows
+still come from the real source table, only where they land changes. The container's
+own login/session/profile/installed-app tables stay untouched automatically (above),
+so nothing else needs excluding by name — this is the whole command either way.
+
+**The target company name is the SQL table prefix, not the AL display name.** BC
+replaces characters SQL doesn't allow in an identifier with `_`, so "CRONUS
+International Ltd." (the name shown in the UI) is
+`CRONUS International Ltd_` (trailing underscore) as a table prefix — `bcdb tables`
+against the target database, or `bcdb tables` against any restore of it, shows the
+real name to use.
+
 **Companies are separate tables.** BC gives every company its own copy of every
 company table (`<Company>$<Table>$<AppId>`; the 28.4 demo database has 1,987 of
 them per company) and registers the company as a row in the `Company` table, which
 has no prefix. A cloud tenant whose company is named differently from the
-container's therefore shares no table name with it: its tables are created under
-its own name and the `Company` row that registers it travels in the same restore.
+container's therefore shares no table name with it: mapped under its own name (no
+`--rename-company` and `--create`), its tables are created fresh rather than
+adopting the container's existing ones — the `Company` row that would register it
+is excluded by default regardless, per above, since a company being loaded into an
+already-registered target company needs no new registration.
 
-**Restart the service tier afterwards.** BC caches records, and a restore under a
-running NST leaves that cache disagreeing with the database — every later request
-fails with *"the field … has changed in the database between initial and JIT load"*
-until the service tier restarts. The data in SQL is correct throughout; it is the
-cache that is stale.
+**A service-tier restart is not usually needed.** A stale service-tier cache is a
+real thing — a row edited directly in SQL is served by the API immediately, but a
+restore that changes what a page has *already looked at* in the current session can
+leave that page showing the old view until the service tier restarts — but it is a
+symptom of a page having been opened before the fix was in place or before the
+restore ran, not an inherent cost of restoring under a live NST. A `--replace`
+restore followed by opening a page for the first time in a session reads current
+data with no restart. If something opened a page — or restored earlier during the
+same session — before you got the command above right, restart the service tier
+once to clear whatever it cached.
 
 > Note: `bcdb restore` is the only command that talks to a SQL Server. Everything
 > else in this tool still runs with no server anywhere.

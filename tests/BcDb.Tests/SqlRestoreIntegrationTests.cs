@@ -194,9 +194,9 @@ public class SqlRestoreIntegrationTests
         try
         {
             using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
-            var report = SqlRestore.Run(src, scratch, new RestoreOptions(), TextWriter.Null);
+            var report = SqlRestore.Run(src, scratch, new RestoreOptions { CreateMissing = true }, TextWriter.Null);
 
-            // probe_notnull was there; everything else the source has was created.
+            // probe_notnull was there; everything else the source has was created (--create).
             Assert.Contains(report.Loaded, l => l.Table == "probe_notnull");
             Assert.Contains(report.Loaded, l => l.Table == "probe_dense");
             Assert.Contains(report.Planned, p => p.Source.Name == "probe_dense" && p.CreateTable);
@@ -241,7 +241,7 @@ public class SqlRestoreIntegrationTests
             Exec(scratch, "ALTER TABLE probe_notnull DROP COLUMN n_nvarchar");
             using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
             var report = SqlRestore.Run(src, scratch,
-                new RestoreOptions { OnlyTables = new[] { "probe_notnull" } }, TextWriter.Null);
+                new RestoreOptions { OnlyTables = new[] { "probe_notnull" }, CreateMissing = true }, TextWriter.Null);
 
             var plan = Assert.Single(report.Planned);
             Assert.Equal(new[] { "n_nvarchar" }, plan.AddColumns.Select(c => c.Name));
@@ -266,6 +266,60 @@ public class SqlRestoreIntegrationTests
             Assert.Equal(new[] { "probe_notnull" }, report.Loaded.Select(l => l.Table));
             Assert.Contains(report.Skipped, s => s.Name == "probe_dense");
             Assert.Equal(ExpectedRows(), Query(scratch, ReadBackSql));
+        }
+        finally { DropScratchDatabase(); }
+    }
+
+    // typeprobe.bak's one real, data-bearing company besides "TP" (RestorePlanTests'
+    // TpExttest) — restoring the whole file, unscoped, always sees both, which is exactly
+    // what the ambiguous-company test below wants.
+    const string TpExttest = "TP$exttest$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+    [SkippableFact]
+    public void CompanyAutoDetectsWhenExactlyOneWithDataOnEachSide()
+    {
+        Skip.If(string.IsNullOrEmpty(Server), $"{EnvVar} is not set — this test needs a real SQL Server");
+
+        var scratch = FreshScratchDatabase();
+        try
+        {
+            // Give the target exactly one company-shaped table — company "TargetCo" — so
+            // TargetCompanies finds exactly one candidate to auto-map into.
+            Exec(scratch, "CREATE TABLE [TargetCo$exttest$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa] (dummy int)");
+
+            using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
+            var log = new StringWriter();
+            // --table scopes the source to just "TP"'s table, so it is the only source
+            // company in view even though the file also carries "ProbeCo" data.
+            var report = SqlRestore.Run(src, scratch,
+                new RestoreOptions { OnlyTables = new[] { TpExttest }, DryRun = true }, log);
+
+            var plan = Assert.Single(report.Planned);
+            Assert.Equal("[dbo].[TargetCo$exttest$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa]", plan.Target.QuotedName);
+            Assert.Contains("TP -> TargetCo", log.ToString(), StringComparison.Ordinal);
+            Assert.Contains("auto-detected", log.ToString(), StringComparison.Ordinal);
+        }
+        finally { DropScratchDatabase(); }
+    }
+
+    [SkippableFact]
+    public void CompanyResolutionRefusesToGuessWhenAmbiguous()
+    {
+        Skip.If(string.IsNullOrEmpty(Server), $"{EnvVar} is not set — this test needs a real SQL Server");
+
+        var scratch = FreshScratchDatabase();
+        try
+        {
+            Exec(scratch, "CREATE TABLE [TargetCo$exttest$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa] (dummy int)");
+
+            using var src = BcSource.Open(RestoreTestSchema.TypeprobeBak);
+            // Unscoped: the source has both "TP" and "ProbeCo" with real data, so there is
+            // no single company to auto-map — refused by name, not guessed at.
+            var ex = Assert.Throws<ArgumentException>(() =>
+                SqlRestore.Run(src, scratch, new RestoreOptions { DryRun = true }, TextWriter.Null));
+            Assert.Contains("TP", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("ProbeCo", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("--rename-company", ex.Message, StringComparison.Ordinal);
         }
         finally { DropScratchDatabase(); }
     }

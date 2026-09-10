@@ -38,6 +38,7 @@ public static class SqlRestore
     {
         using var cn = Connect(connectionString);
         var target = ReadSchema(cn);
+        opts = ResolveCompany(src, target, opts, log);
         var (plans, skipped) = RestorePlanner.Build(src, target, opts);
 
         // A table left out by --table is not news — the caller asked for that — so it is
@@ -64,6 +65,7 @@ public static class SqlRestore
                 + (p.CreateTable ? ", creating the table" : "")
                 + (p.AddColumns.Count > 0 ? $", adding {string.Join(", ", p.AddColumns.Select(c => c.Name))}" : "")
                 + (p.TargetOnlyColumns.Count > 0 ? $", leaving {string.Join(", ", p.TargetOnlyColumns)} to the target" : "")
+                + (p.DroppedColumns.Count > 0 ? $", dropping {string.Join(", ", p.DroppedColumns)} (--allow-column-loss)" : "")
                 + (p.NeedsIdentityInsert ? ", keeping the source's identity values" : ""));
 
         if (opts.DryRun)
@@ -75,6 +77,45 @@ public static class SqlRestore
         var loaded = new List<TableLoad>();
         foreach (var p in plans) loaded.Add(LoadTable(cn, src, p, opts, log));
         return new RestoreReport(plans, loaded, skipped);
+    }
+
+    /// <summary>
+    /// --rename-company, filled in when the caller did not name one: unambiguous only when
+    /// there is exactly one company with data on the source side and exactly one on the
+    /// target's. Refuses by name rather than guessing only once both sides genuinely look
+    /// like they carry company data and still do not resolve to one candidate each — a
+    /// target with *no* company-prefixed tables at all (a scratch database restoring a
+    /// handful of company-agnostic tables by name, mainly the hermetic tests' own shape)
+    /// means there is nothing to map into, so it is left exactly as the caller gave it
+    /// (empty): today's no-rename behavior, unchanged, whatever the source looks like.
+    /// </summary>
+    static RestoreOptions ResolveCompany(IBcSource src, IReadOnlyList<TargetTable> target, RestoreOptions opts, TextWriter log)
+    {
+        if (opts.RenameCompany.Count > 0) return opts;
+
+        var targetCompanies = RestorePlanner.TargetCompanies(target);
+        if (targetCompanies.Count == 0) return opts;
+
+        // A company --table/--exclude-table already scoped this restore away from should
+        // not force a choice — same precedence idea as everywhere else here, just applied
+        // to which tables are even looked at rather than to which get written.
+        var only = new HashSet<string>(opts.OnlyTables, StringComparer.OrdinalIgnoreCase);
+        var exclude = new HashSet<string>(opts.ExcludeTables, StringComparer.OrdinalIgnoreCase);
+        bool InScope(string name) => !exclude.Contains(name) && (only.Count == 0 || only.Contains(name));
+
+        var sourceCompanies = RestorePlanner.SourceCompaniesWithData(src, InScope);
+        if (sourceCompanies.Count == 0) return opts;
+
+        if (sourceCompanies.Count == 1 && targetCompanies.Count == 1)
+        {
+            log.WriteLine($"company {sourceCompanies[0]} -> {targetCompanies[0]} "
+                + "(auto-detected: the only company with data on each side)");
+            return opts with { RenameCompany = new Dictionary<string, string> { [sourceCompanies[0]] = targetCompanies[0] } };
+        }
+        throw new ArgumentException(
+            $"the source has {sourceCompanies.Count} compan{(sourceCompanies.Count == 1 ? "y" : "ies")} with data "
+            + $"({string.Join(", ", sourceCompanies)}) and the target has {targetCompanies.Count} "
+            + $"({string.Join(", ", targetCompanies)}) — pass --rename-company \"Src=Dst\" to say which maps to which");
     }
 
     static SqlConnection Connect(string connectionString)
@@ -260,8 +301,31 @@ public static class SqlRestore
 /// <summary>The `bcdb restore` subcommand: its options, and what it prints.</summary>
 public static class RestoreCommand
 {
-    /// <summary>Reads the restore options off a parsed command line, refusing values that are not ones.</summary>
-    public static RestoreOptions OptionsFrom(Dictionary<string, string> opts, out string connection)
+    /// <summary>
+    /// One flag's on/off/unset state read off two opposite command-line switches (--create
+    /// and --no-create, say), refusing the contradiction of both at once. Unset means the
+    /// caller named neither, so the option's own default applies — everything but --replace
+    /// resolves that silently; --replace's own "unset" is the one case with a third,
+    /// mid-run answer (ask), which is why it is handled separately rather than through this.
+    /// </summary>
+    static bool? Toggle(Dictionary<string, string> opts, string onFlag, string offFlag)
+    {
+        bool on = opts.ContainsKey(onFlag);
+        bool off = opts.ContainsKey(offFlag);
+        if (on && off)
+            throw new ArgumentException($"--{onFlag} and --{offFlag} name opposite choices — pass one or the other, not both");
+        return on ? true : off ? false : null;
+    }
+
+    /// <summary>
+    /// Reads the restore options off a parsed command line, refusing values that are not
+    /// ones. <paramref name="needsReplaceConfirmation"/> is true when the caller named
+    /// neither --replace nor --no-replace — replacing existing rows is the default *effect*,
+    /// but is confirmed rather than assumed, so the returned options' own Replace is only
+    /// provisional in that case; the caller resolves it (interactively or by refusing to run
+    /// non-interactively) before using the options to restore anything.
+    /// </summary>
+    public static RestoreOptions OptionsFrom(Dictionary<string, string> opts, out string connection, out bool needsReplaceConfirmation)
     {
         if (!opts.TryGetValue("to", out var to))
             throw new ArgumentException(
@@ -280,13 +344,30 @@ public static class RestoreCommand
             ? ex.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray()
             : Array.Empty<string>();
 
+        var renameCompany = new Dictionary<string, string>();
+        if (opts.TryGetValue("rename-company", out var rc))
+            foreach (var pair in rc.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0))
+            {
+                int eq = pair.IndexOf('=');
+                if (eq < 0)
+                    throw new ArgumentException(
+                        $"--rename-company expects \"<source company>=<target company>\" pairs, got '{pair}' with no '='");
+                renameCompany[pair[..eq].Trim()] = pair[(eq + 1)..].Trim();
+            }
+
+        bool? replace = Toggle(opts, "replace", "no-replace");
+        needsReplaceConfirmation = replace is null;
+
         return new RestoreOptions
         {
             OnlyTables = only,
             ExcludeTables = exclude,
+            RenameCompany = renameCompany,
             IncludeSystem = opts.ContainsKey("include-system"),
-            Replace = opts.ContainsKey("replace"),
-            CreateMissing = !opts.ContainsKey("no-create"),
+            IncludeIdentity = opts.ContainsKey("include-identity"),
+            Replace = replace ?? false,   // provisional when needsReplaceConfirmation — the caller resolves it
+            CreateMissing = Toggle(opts, "create", "no-create") ?? false,
+            AllowColumnLoss = Toggle(opts, "allow-column-loss", "no-allow-column-loss") ?? true,
             Strict = opts.ContainsKey("strict"),
             DryRun = opts.ContainsKey("dry-run"),
             BatchSize = batch,
@@ -295,12 +376,50 @@ public static class RestoreCommand
 
     public static int Run(IBcSource src, Dictionary<string, string> opts)
     {
-        var options = OptionsFrom(opts, out var connection);
+        var options = OptionsFrom(opts, out var connection, out var needsReplaceConfirmation);
+
+        // --dry-run writes nothing, so there is nothing to confirm — asking would be
+        // asking about an action that is not actually about to happen.
+        if (needsReplaceConfirmation && !options.DryRun)
+        {
+            if (!TryConfirmReplace(out bool replace))
+            {
+                Console.WriteLine("Neither an interactive terminal nor --replace/--no-replace was given — "
+                    + "refusing to guess whether existing rows should be replaced.");
+                return 1;
+            }
+            if (!replace)
+            {
+                Console.WriteLine("Declined — nothing was written. Pass --replace or --no-replace to skip this prompt next time.");
+                return 1;
+            }
+            options = options with { Replace = true };
+        }
+
         // Progress goes to stderr so the one-line result on stdout stays parseable.
         var report = SqlRestore.Run(src, connection, options, Console.Error);
         Console.WriteLine(options.DryRun
             ? $"dry run: {report.Planned.Count} tables would be written, {report.Skipped.Count} skipped"
             : $"{report.Loaded.Count} tables, {report.Loaded.Sum(l => l.Rows)} rows written, {report.Skipped.Count} tables skipped");
         return 0;
+    }
+
+    /// <summary>
+    /// Asks, on the real console, whether to replace existing rows — the interactive half of
+    /// --replace's default. Returns false (without asking anything) when there is no
+    /// interactive terminal to ask on, so a script that forgot --replace/--no-replace gets a
+    /// clear refusal instead of hanging on a prompt nothing will ever answer.
+    /// </summary>
+    static bool TryConfirmReplace(out bool replace)
+    {
+        replace = false;
+        if (Console.IsInputRedirected || Console.IsOutputRedirected) return false;
+
+        Console.Write("This restore will replace existing rows in any target table that already has data. "
+            + "Continue? [y/N] ");
+        var answer = (Console.ReadLine() ?? "").Trim();
+        replace = answer.Equals("y", StringComparison.OrdinalIgnoreCase)
+            || answer.Equals("yes", StringComparison.OrdinalIgnoreCase);
+        return true;
     }
 }
