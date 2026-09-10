@@ -120,5 +120,40 @@ run verify "$BAK281" --fixture "$HERE/fixtures/bc281-installed-application.tsv" 
 run verify "$BAK281" --fixture "$HERE/fixtures/bc281-mycompany-no-series.tsv" --table "No. Series" --company "My Company" --select "Code,Description,\$systemCreatedAt,\$systemId"
 run verify "$BAK281" --fixture "$HERE/fixtures/bc281-mycompany-data-exch-column-def.tsv" --table "Data Exch. Column Def" --company "My Company" --select "Data Exch. Def Code,Data Exch. Line Def Code,Column No.,Name,Length"
 
+# --- restore: rows written into a real SQL Server, read back with its own SELECT
+# The hermetic suite proves what the restore decides and how it converts; only a server
+# proves the rows land. The oracle is that server. Absent, this FAILS like every other
+# missing input here — on a dev machine its absence is a setup error, not a fact.
+PASS=$(docker exec bakreader-oracle printenv MSSQL_SA_PASSWORD 2>/dev/null)
+if [ -z "$PASS" ]; then
+  echo "MISSING ORACLE: container bakreader-oracle is not running, so the restore round trip" >&2
+  echo "cannot be verified. FAILING (not skipping silently). See CLAUDE.md for recreation." >&2
+  exit 3
+fi
+ORACLE="Server=localhost,14330;User ID=sa;Password=$PASS;TrustServerCertificate=True"
+echo "--- restore round trip against the oracle"
+RESTORE_LOG=$(mktemp)
+BCDB_RESTORE_SQL="$ORACLE" dotnet test "$HERE/BcDb.sln" -c Release --no-build \
+  --filter "FullyQualifiedName~SqlRestoreIntegrationTests" > "$RESTORE_LOG" 2>&1 || fail=1
+# They must have RUN, not skipped: a skip here means the connection string never reached
+# them and this gate is checking nothing.
+if grep -qE 'Skipped:[[:space:]]*[1-9]' "$RESTORE_LOG"; then
+  echo "restore round-trip tests SKIPPED — they must run against the oracle here" >&2
+  grep -E 'Skipped|Passed!|Failed!' "$RESTORE_LOG" >&2
+  fail=1
+fi
+grep -E 'Passed!|Failed!' "$RESTORE_LOG" || { cat "$RESTORE_LOG" >&2; fail=1; }
+rm -f "$RESTORE_LOG"
+
+# The command line's own path, against the database typeprobe.bak is a backup of: every
+# table and column must match, so a dry run has to plan them all and refuse nothing.
+PLAN=$("$BCDB" restore "$TP" --to "$ORACLE;Database=typeprobe" --dry-run 2>&1) || { echo "$PLAN" >&2; fail=1; }
+echo "$PLAN" | grep -q 'plan  probe_notnull -> \[dbo\].\[probe_notnull\]: 26 columns' \
+  || { echo "dry run did not plan probe_notnull's 26 writable columns:" >&2; echo "$PLAN" >&2; fail=1; }
+echo "$PLAN" | grep -q 'skip  \$probe\$platform' \
+  || { echo "dry run did not skip the platform table \$probe\$platform:" >&2; echo "$PLAN" >&2; fail=1; }
+echo "$PLAN" | grep -q -- '--dry-run: nothing was written' \
+  || { echo "dry run did not say it wrote nothing:" >&2; echo "$PLAN" >&2; fail=1; }
+
 [ $fail -eq 0 ] && echo "ALL VERIFICATIONS PASSED" || echo "VERIFICATION FAILURES" >&2
 exit $fail

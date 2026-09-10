@@ -9,6 +9,14 @@ public sealed record SysColumn(int ColId, string Name, byte XType, short MaxLeng
 {
     /// <summary>The SQL type name, e.g. "nvarchar" or "datetime2".</summary>
     public string TypeName => SqlTypes.Name(XType);
+
+    /// <summary>
+    /// Whether the column accepts NULL, as its own container declares it. Nothing in the
+    /// reading path needs this — a record's null bitmap carries a bit either way — but
+    /// anything that recreates the table elsewhere does, so both containers answer it:
+    /// a .bak from syscolpars.status, a .bacpac from model.xml's Nullable property.
+    /// </summary>
+    public bool IsNullable { get; init; } = true;
 }
 internal sealed record SysIndexCol(int IndexId, int KeyOrdinal, int ColId);
 
@@ -190,9 +198,19 @@ internal sealed class Catalog
             byte xtype = fx[10];
             short maxLen = BinaryPrimitives.ReadInt16LittleEndian(fx[15..]);
             byte prec = fx[17], scale = fx[18];
+            // status u32@23: bit 0x01 = NOT NULL. Derived from the probe database, whose
+            // `probe` table declares every type NULL and `probe_notnull`/`probe_dense`
+            // declare every type NOT NULL, and validated against sys.columns.is_nullable
+            // for all 383 columns of it (fixtures/typeprobe-nullability.tsv). Bit 0x02
+            // rides along on char/binary columns (ANSI_PADDING) and is not read here.
+            if (fx.Length < 27)
+                throw new InvalidDataException(
+                    $"syscolpars record for object {objId} column {colId} is {fx.Length} fixed bytes, "
+                    + "too short to carry the status word — refusing to guess nullability");
+            uint status = BinaryPrimitives.ReadUInt32LittleEndian(fx[23..]);
             string name = nameLen > 0 ? DecodeUtf16(page, nameStart, nameLen) : $"col{colId}";
             if (!Columns.TryGetValue(objId, out var list)) Columns[objId] = list = new();
-            list.Add(new SysColumn(colId, name, xtype, maxLen, prec, scale));
+            list.Add(new SysColumn(colId, name, xtype, maxLen, prec, scale) { IsNullable = (status & 0x01) == 0 });
         }
         foreach (var list in Columns.Values) list.Sort((a, b) => a.ColId.CompareTo(b.ColId));
         var isColsRows = objectId is { } seekIsCols

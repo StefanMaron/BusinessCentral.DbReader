@@ -55,7 +55,7 @@ internal sealed record BacpacColumn(string Name, string ModelType, byte XType, b
 
     internal static int TimeWidth(int scale) => scale <= 2 ? 3 : scale <= 4 ? 4 : 5;
 
-    public SysColumn ToSysColumn(int colId) => new(colId, Name, XType, MaxLength, Precision, Scale);
+    public SysColumn ToSysColumn(int colId) => new(colId, Name, XType, MaxLength, Precision, Scale) { IsNullable = Nullable };
 }
 
 /// <summary>A table as model.xml declares it: its columns in data-stream order and its primary key.</summary>

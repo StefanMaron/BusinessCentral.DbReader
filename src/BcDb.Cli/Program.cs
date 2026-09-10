@@ -38,6 +38,7 @@ public static class Program
                 "read" => Read(src, opts),
                 "verify" => Verify(src, opts),
                 "serve" => Serve(src, opts, Console.In, Console.Out),
+                "restore" => RestoreCommand.Run(src, opts),
                 _ => Usage(),
             };
         }
@@ -102,6 +103,71 @@ public static class Program
                                                               "merge-extensions": ..}; one JSON response line each. A key the command
                                                               does not accept fails the request instead of being ignored.)
               bcdb verify <file> --fixture <fixture.tsv> --table <name> --select "A,B"
+              bcdb restore <file> --to "<connection string>" [--rename-company "Src=Dst,..."] [--replace|--no-replace] [--create|--no-create] [--allow-column-loss|--no-allow-column-loss] [--include-system] [--include-identity] [--dry-run] [--strict] [--batch-size N]
+                                                             write the source's rows into a database that already
+                                                             exists — a BC container with its extensions installed.
+                                                             Tables and columns are matched by name. The defaults
+                                                             assume the common case: a container whose extensions
+                                                             already built the target's schema correctly, which this
+                                                             restore only fills — `bcdb restore file.bacpac --to "…"`
+                                                             is a complete command on its own.
+                                                             A table or column the target lacks is left alone and
+                                                             reported, not created — building one from the source's
+                                                             bare schema cannot reproduce what BC's own schema sync
+                                                             generates (SumIndexField views, ...) when a table is
+                                                             created through BC itself; --create opts into building
+                                                             it anyway, for a target that was never meant to have a
+                                                             real BC schema. --allow-column-loss (on by default,
+                                                             --no-allow-column-loss turns it off) drops a source
+                                                             column's values instead of refusing the whole table when
+                                                             the target lacks that column — for a source whose
+                                                             installed extensions don't quite match the target's own
+                                                             (a production tenant rarely matches a dev sandbox's
+                                                             extension set exactly, and a table's extension-added
+                                                             "$ext" companion needs its own rows or list pages over
+                                                             the main table can render empty); every dropped column
+                                                             is still named in the plan.
+                                                             Replacing existing rows is the default effect, but is
+                                                             confirmed rather than assumed: with neither --replace
+                                                             nor --no-replace, an interactive terminal is asked
+                                                             before anything is written, and a non-interactive one
+                                                             (a script, CI) is refused rather than guessed at — pass
+                                                             --replace or --no-replace explicitly there. --dry-run
+                                                             prints the plan (skipping the prompt, since nothing
+                                                             would be written either way) and writes nothing;
+                                                             --strict stops the whole restore on a table that cannot
+                                                             be reconciled instead of reporting it and carrying on.
+                                                             Two families of tables are left alone regardless of any
+                                                             of the above, reported like any other skip, because
+                                                             they describe the *container* running the restore
+                                                             rather than the exported tenant's business data: the
+                                                             platform's own $ndo$... tables (--include-system writes
+                                                             them anyway), and the container's login/session/profile/
+                                                             installed-app tables — User, Access Control, User
+                                                             Personalization, User Property, Company, the Tenant
+                                                             Profile family, the NAV App family (--include-identity
+                                                             writes them anyway). Restoring either kind locks the
+                                                             container's own login out, breaks role-center/profile
+                                                             resolution on the next service-tier restart, or points
+                                                             its installed-app registry at packages it never
+                                                             compiled. Both win over --table, the same as
+                                                             --exclude-table, which leaves any other specific tables
+                                                             completely untouched (not created, not written) for a
+                                                             caller's own reasons.
+                                                             --rename-company maps a source company's table prefix
+                                                             onto an existing target company's — rows still come
+                                                             from the real source table, only where they land
+                                                             changes. It is optional when there is exactly one
+                                                             company with data on the source side and exactly one
+                                                             on the target's — those two are mapped automatically,
+                                                             which is the common case of loading a SaaS tenant's one
+                                                             company into a container's one differently-named
+                                                             company (CRONUS or otherwise). With more than one
+                                                             company on either side it is refused rather than
+                                                             guessed, naming the companies actually found; pass
+                                                             --rename-company to say which maps to which. A
+                                                             container's certificate is self-signed, so the
+                                                             connection string needs TrustServerCertificate=True.
               bcdb --version                                      version, platform and build flavor
             check and validate are page-map commands and need a .bak.
             --prefetch works with any command. An option the command does not accept fails
@@ -138,13 +204,22 @@ public static class Program
         ["read"] = ReadOpts,
         ["verify"] = ReadOpts.Concat(new[] { "fixture" }).ToArray(),
         ["serve"] = new[] { "symbols" },
+        ["restore"] = new[]
+        {
+            "to", "replace", "no-replace", "dry-run", "batch-size", "table", "exclude-table", "rename-company",
+            "create", "no-create", "allow-column-loss", "no-allow-column-loss", "include-system", "include-identity", "strict",
+        },
     };
 
     /// <summary>Accepted by every subcommand: it is applied when the file is opened.</summary>
     static readonly string[] GlobalOpts = { "prefetch" };
 
     /// <summary>Options that are switches — they take no value.</summary>
-    static readonly HashSet<string> ValuelessOpts = new(StringComparer.Ordinal) { "prefetch", "merge-extensions" };
+    static readonly HashSet<string> ValuelessOpts = new(StringComparer.Ordinal)
+        {
+            "prefetch", "merge-extensions", "replace", "no-replace", "dry-run", "include-system", "include-identity",
+            "create", "no-create", "allow-column-loss", "no-allow-column-loss", "strict",
+        };
 
     /// <summary>
     /// The command line's options for one subcommand.
