@@ -418,7 +418,7 @@ public static class Program
                 Console.WriteLine($"{f.Id,6}  {f.Name,-40} {f.TypeName,-28} {sqlCol.Name,-40} {SqlTypes.Name(sqlCol.XType)}{Len(sqlCol)}");
         }
         var (companion, extFields) = ExtensionColumns(src, sym, t);
-        foreach (var (c, extApp, ext, field) in extFields)
+        foreach (var (c, extApp, ext, field) in BaseExtensionColumns(src, sym, t).Concat(extFields))
         {
             if (field != null)
                 Console.WriteLine($"{field.Id,6}  {field.Name,-40} {field.TypeName,-28} {c.Name,-40} {SqlTypes.Name(c.XType)}{Len(c)} (tableextension \"{ext!.Name}\", {ext.AppName})");
@@ -470,6 +470,24 @@ public static class Program
     }
 
     /// <summary>
+    /// Extension fields stored as columns of the base table itself ("&lt;Field&gt;$&lt;extending
+    /// app id&gt;"), the BC 29 layout: there is no $ext companion, and the same
+    /// resolution through the extending app's tableextension symbols applies.
+    /// </summary>
+    static List<(SysColumn Col, string ExtAppId, AlTableExtension? Ext, AlField? Field)>
+        BaseExtensionColumns(IBcSource src, SymbolStore? sym, BcTable t)
+    {
+        var extCols = new List<(SysColumn, string, AlTableExtension?, AlField?)>();
+        foreach (var c in src.Columns(t.Table))
+        {
+            if (SplitExtColumn(c.Name) is not { } split) continue;
+            var hit = sym?.FindExtensionField(split.ExtAppId, StripExt(t.TableName), t.AppId, split.BaseName);
+            extCols.Add((c, split.ExtAppId, hit?.Ext, hit?.Field));
+        }
+        return extCols;
+    }
+
+    /// <summary>
     /// Resolves one --select / --sha256 name to a column, by SQL column name or AL field
     /// name. The name is matched as written first and only then trimmed: BC turns an AL
     /// field name carrying a leading or trailing space into a SQL column with that space
@@ -495,7 +513,7 @@ public static class Program
         }
     }
 
-    static IEnumerable<(List<SysColumn> cols, List<string> headers, List<object?[]> rows)> ReadCore(IBcSource src, Dictionary<string, string> opts, SymbolStore? preloadedSym = null)
+    static IEnumerable<(List<SysColumn> cols, List<string> headers, List<object?[]> rows, string? note)> ReadCore(IBcSource src, Dictionary<string, string> opts, SymbolStore? preloadedSym = null)
     {
         var t = ResolveTable(src, opts);
         var sym = preloadedSym ?? LoadSymbols(opts);
@@ -535,10 +553,14 @@ public static class Program
         }
 
         // A selectable column: from the base table or the companion, with its AL header.
+        // Base-table "<Field>$<app id>" columns (BC 29) get their AL name from the extending
+        // app's tableextension symbols, like companion columns do.
+        var baseExt = BaseExtensionColumns(src, sym, t).ToDictionary(e => e.Col.Name, e => e.Field, StringComparer.OrdinalIgnoreCase);
         var all = new List<(SysColumn Col, bool FromExt, string Header)>();
         foreach (var c in cols)
             all.Add((c, false, alTable?.Fields.FirstOrDefault(f => f.FieldClass == "Normal"
-                && SqlNames.Normalize(f.Name).Equals(c.Name, StringComparison.OrdinalIgnoreCase))?.Name ?? c.Name));
+                && SqlNames.Normalize(f.Name).Equals(c.Name, StringComparison.OrdinalIgnoreCase))?.Name
+                ?? (baseExt.TryGetValue(c.Name, out var bf) ? bf?.Name : null) ?? c.Name));
         foreach (var (c, _, _, field) in extCols)
             all.Add((c, true, field?.Name ?? c.Name));
 
@@ -603,13 +625,21 @@ public static class Program
                 return v;
             }).ToArray());
         }
-        yield return (selected.Select(s => s.Col).ToList(), headers, outRows);
+        // --merge-extensions on a table with no companion did nothing; say so, so "nothing to
+        // merge" is distinguishable from "merge not applied" (issue #23).
+        string? note = null;
+        if (opts.ContainsKey("merge-extensions") && companion is null)
+            note = baseExt.Count > 0
+                ? $"--merge-extensions: {t.SqlName} has no $ext companion; its extension fields are columns of the base table (BC 29 layout) and are returned without merging"
+                : $"--merge-extensions: {t.SqlName} has no $ext companion and no extension columns; nothing to merge";
+        yield return (selected.Select(s => s.Col).ToList(), headers, outRows, note);
     }
 
     static int Read(IBcSource src, Dictionary<string, string> opts)
     {
-        foreach (var (selected, headers, rows) in ReadCore(src, opts))
+        foreach (var (selected, headers, rows, note) in ReadCore(src, opts))
         {
+            if (note != null) Console.Error.WriteLine(note);
             bool json = opts.TryGetValue("format", out var fm) && fm == "json";
             if (json)
             {
@@ -743,7 +773,7 @@ public static class Program
 
     static string ServeRead(IBcSource src, SymbolStore? sym, Dictionary<string, string> opts, string idJson)
     {
-        foreach (var (_, headers, rows) in ReadCore(src, opts, sym))
+        foreach (var (_, headers, rows, note) in ReadCore(src, opts, sym))
         {
             var sb = new StringBuilder();
             sb.Append("{\"id\": ").Append(idJson).Append(", \"ok\": true, \"headers\": [")
@@ -753,7 +783,9 @@ public static class Program
                 if (i > 0) sb.Append(", ");
                 sb.Append('[').Append(string.Join(", ", rows[i].Select(JVal))).Append(']');
             }
-            return sb.Append("]}").ToString();
+            sb.Append(']');
+            if (note != null) sb.Append(", \"note\": ").Append(J(note));
+            return sb.Append('}').ToString();
         }
         throw new InvalidOperationException("unreachable: ReadCore yields exactly once");
     }
@@ -815,7 +847,7 @@ public static class Program
             sb.Append('}');
         }
         var (_, extFields) = ExtensionColumns(src, sym, t);
-        foreach (var (c, extApp, ext, field) in extFields)
+        foreach (var (c, extApp, ext, field) in BaseExtensionColumns(src, sym, t).Concat(extFields))
         {
             sb.Append(", {\"id\": ").Append(field?.Id.ToString() ?? "null")
               .Append(", \"name\": ").Append(J(field?.Name ?? c.Name))
@@ -839,7 +871,7 @@ public static class Program
         var expected = File.ReadAllLines(fixPath).Where(l => l.Length > 0)
             .Select(l => l.EndsWith("|#", StringComparison.Ordinal) ? l[..^2] : l)
             .OrderBy(x => x, StringComparer.Ordinal).ToList();
-        foreach (var (_, _, rows) in ReadCore(src, opts))
+        foreach (var (_, _, rows, _) in ReadCore(src, opts))
         {
             var actual = rows.Select(r => string.Join("|", r.Select(v => Fmt(v))))
                              .OrderBy(x => x, StringComparer.Ordinal).ToList();
