@@ -34,7 +34,7 @@ public class NullabilityTests
     public void BakNullabilityMatchesTheOracle()
     {
         var expected = Fixture();
-        Assert.Equal(383, expected.Count);
+        Assert.Equal(387, expected.Count);
         Assert.Equal(expected, FromSource("typeprobe.bak"));
     }
 
@@ -55,7 +55,7 @@ public class NullabilityTests
     {
         // A test that passed by answering "nullable" to everything would be worthless.
         var actual = FromSource("typeprobe.bak");
-        Assert.Equal(64, actual.Count(a => a.EndsWith("|0", StringComparison.Ordinal)));
-        Assert.Equal(319, actual.Count(a => a.EndsWith("|1", StringComparison.Ordinal)));
+        Assert.Equal(65, actual.Count(a => a.EndsWith("|0", StringComparison.Ordinal)));
+        Assert.Equal(322, actual.Count(a => a.EndsWith("|1", StringComparison.Ordinal)));
     }
 }

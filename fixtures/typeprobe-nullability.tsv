@@ -381,3 +381,7 @@ TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|id|0|#
 TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|own|1|#
 TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa$ext|stranger|0|#
 TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa$ext|extra$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb|1|#
+TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|id|0|#
+TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|own|1|#
+TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|extra$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb|1|#
+TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|num$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb|1|#

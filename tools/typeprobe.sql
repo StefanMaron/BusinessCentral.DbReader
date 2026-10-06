@@ -229,6 +229,17 @@ CREATE TABLE [TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa$ext] (
   CONSTRAINT [pk_tp_exttest3_ext] PRIMARY KEY CLUSTERED (stranger));
 INSERT INTO [TP$exttest3$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa$ext] VALUES (1, N'unreachable');
 GO
+-- BC 29 storage shape (GitHub issue #23): table-extension fields are columns of the base
+-- table itself, named <field>$<extending app id>, and there is no $ext companion at all.
+IF OBJECT_ID('[TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa]') IS NOT NULL DROP TABLE [TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa];
+CREATE TABLE [TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa] (
+  id int NOT NULL, own nvarchar(20) NULL,
+  [extra$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb] nvarchar(20) NULL,
+  [num$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb] int NULL,
+  CONSTRAINT [pk_tp_exttest4] PRIMARY KEY CLUSTERED (id));
+INSERT INTO [TP$exttest4$aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa] VALUES
+  (1, N'base-one', N'ext-one', 11), (2, N'base-two', NULL, 22), (3, N'base-three', NULL, NULL);
+GO
 -- Two apps defining the same table name in the same company (legal via AL
 -- namespaces; Microsoft's own demo database ships Dimension Set Entry twice) —
 -- the app id suffix is the only distinguishing part, selectable with --app

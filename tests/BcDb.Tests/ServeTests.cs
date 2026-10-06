@@ -174,6 +174,78 @@ public class ServeTests
         Assert.Equal(JsonValueKind.Null, rows[3][3].ValueKind);
     }
 
+    // exttest4 is the BC 29 shape (GitHub issue #23): the extension fields are columns of the
+    // base table itself, "<field>$<extending app id>", and there is no $ext companion.
+    [Fact]
+    public void ReadMapsBaseTableExtensionColumnsToAlNames()
+    {
+        var r = Assert.Single(Run(ExtTestSymbols,
+            """{"cmd": "read", "table": "exttest4"}""")).RootElement;
+        Assert.True(r.GetProperty("ok").GetBoolean(), r.ToString());
+        Assert.Equal(new[] { "id", "own", "extra", "num" },
+            r.GetProperty("headers").EnumerateArray().Select(h => h.GetString()).ToArray());
+        var rows = r.GetProperty("rows").EnumerateArray().ToDictionary(row => row[0].GetInt64(), row => row);
+        // oracle values — fixtures/typeprobe-probe-exttest4.tsv
+        Assert.Equal("ext-one", rows[1][2].GetString());
+        Assert.Equal(11, rows[1][3].GetInt64());
+        Assert.Equal(JsonValueKind.Null, rows[2][2].ValueKind);
+        Assert.Equal(22, rows[2][3].GetInt64());
+        Assert.False(r.TryGetProperty("note", out _));   // no merge asked, nothing to say
+    }
+
+    [Fact]
+    public void SelectAddressesABaseTableExtensionColumnByAlName()
+    {
+        var r = Assert.Single(Run(ExtTestSymbols,
+            """{"cmd": "read", "table": "exttest4", "select": "id,extra"}""")).RootElement;
+        Assert.True(r.GetProperty("ok").GetBoolean(), r.ToString());
+        Assert.Equal(new[] { "id", "extra" },
+            r.GetProperty("headers").EnumerateArray().Select(h => h.GetString()).ToArray());
+    }
+
+    [Fact]
+    public void DescribeListsBaseTableExtensionFields()
+    {
+        var r = Assert.Single(Run(ExtTestSymbols,
+            """{"cmd": "describe", "table": "exttest4"}""")).RootElement;
+        Assert.True(r.GetProperty("ok").GetBoolean(), r.ToString());
+        var fields = r.GetProperty("fields").EnumerateArray()
+            .Where(f => f.GetProperty("sqlColumn").ValueKind == JsonValueKind.String)
+            .ToDictionary(f => f.GetProperty("name").GetString()!, f => f);
+        Assert.Equal(50122, fields["extra"].GetProperty("id").GetInt32());
+        Assert.Equal("Text", fields["extra"].GetProperty("type").GetString());
+        Assert.Equal("extra$bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", fields["extra"].GetProperty("sqlColumn").GetString());
+        Assert.Equal(50123, fields["num"].GetProperty("id").GetInt32());
+        Assert.Equal("ExtTest Ext", fields["num"].GetProperty("extension").GetProperty("appName").GetString());
+    }
+
+    [Fact]
+    public void MergeExtensionsWithoutACompanionSaysSoInsteadOfSilentlyDoingNothing()
+    {
+        var r = Assert.Single(Run(ExtTestSymbols,
+            """{"cmd": "read", "table": "exttest4", "merge-extensions": true}""")).RootElement;
+        Assert.True(r.GetProperty("ok").GetBoolean(), r.ToString());
+        string note = r.GetProperty("note").GetString()!;
+        Assert.Contains("no $ext companion", note);
+        Assert.Contains("base table", note);
+        // and the data is still the full AL record
+        Assert.Equal(new[] { "id", "own", "extra", "num" },
+            r.GetProperty("headers").EnumerateArray().Select(h => h.GetString()).ToArray());
+
+        // a table with neither companion nor extension columns: "nothing to merge"
+        var plain = Assert.Single(Run(
+            """{"cmd": "read", "table": "probe", "select": "id", "merge-extensions": true}""")).RootElement;
+        Assert.Contains("nothing to merge", plain.GetProperty("note").GetString());
+    }
+
+    [Fact]
+    public void MergeExtensionsWithACompanionCarriesNoNote()
+    {
+        var r = Assert.Single(Run(ExtTestSymbols,
+            """{"cmd": "read", "table": "exttest", "merge-extensions": true}""")).RootElement;
+        Assert.False(r.TryGetProperty("note", out _));
+    }
+
     // exttest2 carries Base Application's Posted Gen. Journal Line shape (table 181): the
     // base table's primary key is (id) alone, but its CLUSTERED index is (tmpl, batch, id),
     // and BC keys the $ext companion on the primary key. Joining a merged read on the base

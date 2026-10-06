@@ -59,6 +59,8 @@ run verify "$TP" --table exttest --merge-extensions --symbols "$HERE/fixtures/sy
 # primary key alone -- Posted Gen. Journal Line's shape (issue #17). No --symbols: the join
 # key comes from the companion itself, so a merged read needs none.
 run verify "$TP" --table exttest2 --merge-extensions --fixture "$HERE/fixtures/typeprobe-probe-exttest2-merged.tsv"
+run verify "$TP" --table exttest4 --merge-extensions --symbols "$HERE/fixtures/symbols-exttest-base.json,$HERE/fixtures/symbols-exttest-ext.json" \
+    --fixture "$HERE/fixtures/typeprobe-probe-exttest4.tsv" --select "id,own,extra,num"
 
 # --- typeprobe as a .bacpac: a sqlpackage export of the same database state, so every
 # fixture above must come back identical through the zip + model.xml + native-BCP path.
@@ -82,6 +84,8 @@ run verify "$BP" --table probe_oddnames --fixture "$HERE/fixtures/typeprobe-prob
 run verify "$BP" --table exttest --merge-extensions --symbols "$HERE/fixtures/symbols-exttest-base.json,$HERE/fixtures/symbols-exttest-ext.json" \
     --fixture "$HERE/fixtures/typeprobe-probe-exttest-merged.tsv" --select "id,own,extra,num"
 run verify "$BP" --table exttest2 --merge-extensions --fixture "$HERE/fixtures/typeprobe-probe-exttest2-merged.tsv"
+run verify "$BP" --table exttest4 --merge-extensions --symbols "$HERE/fixtures/symbols-exttest-base.json,$HERE/fixtures/symbols-exttest-ext.json" \
+    --fixture "$HERE/fixtures/typeprobe-probe-exttest4.tsv" --select "id,own,extra,num"
 
 # --- BC demo databases, both shipped versions
 run verify "$BAK275" --fixture "$HERE/fixtures/bc275-no-series.tsv"  --table "No. Series"  --select "Code,Description,Default Nos_,Manual Nos_,Date Order,\$systemId"

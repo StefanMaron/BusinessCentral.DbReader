@@ -10,6 +10,15 @@
         { "Id": 50120, "Name": "extra", "TypeDefinition": { "Name": "Text" } },
         { "Id": 50121, "Name": "num", "TypeDefinition": { "Name": "Integer" } }
       ]
+    },
+    {
+      "Id": 50111,
+      "Name": "exttest4 - ext",
+      "TargetObject": "#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#exttest4",
+      "Fields": [
+        { "Id": 50122, "Name": "extra", "TypeDefinition": { "Name": "Text" } },
+        { "Id": 50123, "Name": "num", "TypeDefinition": { "Name": "Integer" } }
+      ]
     }
   ]
 }

@@ -1157,3 +1157,19 @@ takes. What follows is therefore mostly *decisions and their evidence*, not stru
 - 28.2, 28.3 and 28.4 read correctly once the walk ends at the copy's end; 28.1's map is
   byte-identical before and after that change (SHA-256 over G/L Entry, Customer,
   G/L Account and Item, `CRONUS International Ltd_`).
+
+## BC version differences observed (28.5 vs 29.0): extension fields in the base table
+- Reported in GitHub issue #23 from a BC 29.0.54011.55816 W1 demo backup (not available
+  on this machine, so the report is the evidence): table-extension fields are columns of
+  the **base table**, named `<sql field name>$<extending app id>`, and `bcdb tables` lists
+  no `$ext` companions (0, against 268 in 28.5.54151.55132). The column naming is the same
+  as in a companion, only the table differs.
+- The reader therefore resolves a `<name>$<guid>` column of the base table through the
+  extending app's tableextension symbols exactly as it resolves a companion column
+  (`FindExtensionField`), for `read` headers, `--select`, and `describe`. A merged read has
+  nothing to join in that layout and says so (stderr for the CLI, a `note` member in a
+  serve response) instead of silently returning the unmerged result.
+- Validation: the `exttest4` probe table (`tools/typeprobe.sql`) is that shape with
+  known values; `fixtures/typeprobe-probe-exttest4.tsv` is a plain `SELECT` of it on the
+  oracle, compared through both the `.bak` and the `.bacpac` by `verify.sh`. No BC 29
+  backup has been read yet: re-run the Return Reason read from the issue when one is at hand.
